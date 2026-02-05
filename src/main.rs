@@ -651,14 +651,33 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
         .show(ctx, |ui| {
             let origin = ui.min_rect().min;
             let available = ui.available_size();
-            let top_h = available.y * 0.8;
-            let bottom_h = available.y - top_h;
+            let bottom_h = 28.0; // Fixed height: just enough for status text
+            let top_h = (available.y - bottom_h).max(0.0);
 
             let top_rect = egui::Rect::from_min_size(origin, egui::vec2(available.x, top_h));
             let bottom_rect = egui::Rect::from_min_size(
                 egui::pos2(origin.x, origin.y + top_h),
                 egui::vec2(available.x, bottom_h),
             );
+
+            // Resize terminal to match available area
+            if let Some(ref mut term) = ui_state.terminal {
+                let margin = 4.0;
+                let content_w = (top_rect.width() - margin * 2.0).max(0.0);
+                let content_h = (top_rect.height() - margin * 2.0).max(0.0);
+                let font_id = egui::FontId::monospace(terminal::TERM_FONT_SIZE);
+                let row_height = ui.fonts(|f| f.row_height(&font_id));
+                let char_width = ui.fonts(|f| f.glyph_width(&font_id, 'M'));
+                if row_height > 0.0 && char_width > 0.0 {
+                    let new_rows = (content_h / row_height).floor() as u16;
+                    let new_cols = (content_w / char_width).floor() as u16;
+                    if new_rows > 0 && new_cols > 0
+                        && (new_rows as usize != term.rows() || new_cols as usize != term.cols())
+                    {
+                        term.resize(new_rows, new_cols);
+                    }
+                }
+            }
 
             // Top area: terminal display
             ui.allocate_ui_at_rect(top_rect, |ui| {

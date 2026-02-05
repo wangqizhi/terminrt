@@ -14,7 +14,7 @@ use winit::keyboard::{Key, NamedKey};
 
 use crate::pty::{self, PtySize, PtyWriter};
 
-const TERM_FONT_SIZE: f32 = 14.0;
+pub const TERM_FONT_SIZE: f32 = 14.0;
 
 #[derive(Copy, Clone)]
 struct TermDims {
@@ -214,6 +214,15 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
     let num_lines = term.screen_lines();
     let num_cols = term.columns();
 
+    // Cursor blink: 500ms on / 500ms off
+    let cursor_visible = {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        (ms / 500) % 2 == 0
+    };
+
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -229,18 +238,18 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
                     let ch = cell.c;
                     let display_char = if ch == '\0' || ch == ' ' { ' ' } else { ch };
 
-                    let is_cursor = cursor.point == Point::new(line, col);
+                    let show_cursor = cursor.point == Point::new(line, col) && cursor_visible;
                     let is_wide_continuation = cell.flags.contains(CellFlags::WIDE_CHAR_SPACER);
                     if is_wide_continuation {
                         continue;
                     }
 
-                    let fg = if is_cursor {
+                    let fg = if show_cursor {
                         egui::Color32::from_rgb(18, 18, 18)
                     } else {
                         term_color_to_egui(&cell.fg, true)
                     };
-                    let bg = if is_cursor {
+                    let bg = if show_cursor {
                         egui::Color32::from_rgb(204, 204, 204)
                     } else {
                         let bg_color = term_color_to_egui(&cell.bg, false);
