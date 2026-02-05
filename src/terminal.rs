@@ -321,8 +321,11 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
                         continue;
                     }
 
+                    let is_ghost = cell.flags.intersects(CellFlags::DIM | CellFlags::ITALIC);
                     let fg = if show_cursor {
                         egui::Color32::from_rgb(18, 18, 18)
+                    } else if is_ghost {
+                        egui::Color32::from_gray(140)
                     } else {
                         term_color_to_egui(&cell.fg, true)
                     };
