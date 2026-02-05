@@ -18,6 +18,14 @@ use crate::pty::{self, PtySize, PtyWriter};
 pub const TERM_FONT_SIZE: f32 = 14.0;
 const VT_LOG_MAX_LINES: usize = 2000;
 
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ScrollRequest {
+    /// Scroll so the top of the terminal screen (after scrollback) is visible.
+    ScreenTop,
+    /// Scroll so the current cursor line is aligned to the top.
+    CursorTop,
+}
+
 #[derive(Copy, Clone)]
 struct TermDims {
     cols: usize,
@@ -240,7 +248,7 @@ fn named_color_to_egui(named: &NamedColor, is_fg: bool) -> egui::Color32 {
     }
 }
 
-fn indexed_color_to_egui(idx: u8, is_fg: bool) -> egui::Color32 {
+fn indexed_color_to_egui(idx: u8, _is_fg: bool) -> egui::Color32 {
     // Standard 16 colors
     static ANSI_COLORS: [[u8; 3]; 16] = [
         [0, 0, 0],       [204, 0, 0],     [78, 154, 6],   [196, 160, 0],
@@ -266,7 +274,44 @@ fn indexed_color_to_egui(idx: u8, is_fg: bool) -> egui::Color32 {
     egui::Color32::from_rgb(v, v, v)
 }
 
-pub fn render_terminal(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
+fn align_to_pixels(value: f32, pixels_per_point: f32) -> f32 {
+    if pixels_per_point <= 0.0 {
+        return value;
+    }
+    (value * pixels_per_point).round() / pixels_per_point
+}
+
+fn align_to_pixels_ceil(value: f32, pixels_per_point: f32) -> f32 {
+    if pixels_per_point <= 0.0 {
+        return value;
+    }
+    (value * pixels_per_point).ceil() / pixels_per_point
+}
+
+pub(crate) fn aligned_row_height(ui: &egui::Ui, font_id: &egui::FontId) -> f32 {
+    let raw = ui.fonts(|f| f.row_height(font_id)).max(1.0);
+    let aligned = align_to_pixels_ceil(raw, ui.ctx().pixels_per_point());
+    aligned.max(1.0)
+}
+
+pub(crate) fn aligned_glyph_width(
+    ui: &egui::Ui,
+    font_id: &egui::FontId,
+    ch: char,
+) -> f32 {
+    let raw = ui.fonts(|f| f.glyph_width(font_id, ch));
+    if raw <= 0.0 {
+        return 0.0;
+    }
+    align_to_pixels(raw, ui.ctx().pixels_per_point())
+}
+
+pub fn render_terminal(
+    ui: &mut egui::Ui,
+    terminal: Option<&TerminalInstance>,
+    scroll_request: Option<ScrollRequest>,
+    scroll_id: u64,
+) {
     let terminal = match terminal {
         Some(t) => t,
         None => {
@@ -288,7 +333,11 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
     let history_lines = grid.history_size();
     let top_line = -(history_lines as i32);
     let font_id = egui::FontId::monospace(TERM_FONT_SIZE);
-    let row_height = ui.fonts(|f| f.row_height(&font_id)).max(1.0);
+    let pixels_per_point = ui.ctx().pixels_per_point();
+    // Set item_spacing to 0 BEFORE calculating row_height and show_rows,
+    // so the scroll calculations use the same spacing as the actual layout.
+    ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
+    let row_height = aligned_row_height(ui, &font_id);
 
     // Cursor blink: 500ms on / 500ms off
     let cursor_visible = {
@@ -299,12 +348,66 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
         (ms / 500) % 2 == 0
     };
 
-    egui::ScrollArea::vertical()
+    // Use scroll_id in the ScrollArea ID so Ctrl+L resets the scroll state
+    let mut scroll = egui::ScrollArea::vertical()
+        .id_source(("terminal_scroll", scroll_id))
         .auto_shrink([false, false])
-        .stick_to_bottom(true)
-        .show_rows(ui, row_height, total_lines, |ui, row_range| {
-            ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
-            for row_idx in row_range {
+        .animated(false);
+
+    if let Some(req) = scroll_request {
+        let offset = match req {
+            // Show the terminal "screen" (last `screen_lines` rows), not the absolute end of the
+            // scrollback buffer (which can be blank below the cursor and confusing on startup).
+            ScrollRequest::ScreenTop => row_height * history_lines as f32,
+            // Scroll to absolute top (offset 0) - used for a clean slate
+            ScrollRequest::CursorTop => 0.0,
+        };
+        let offset = align_to_pixels_ceil(offset, pixels_per_point).max(0.0);
+        scroll = scroll.vertical_scroll_offset(offset);
+    }
+
+    let row_height_with_spacing = row_height + ui.spacing().item_spacing.y;
+
+    scroll.show_viewport(ui, |ui, viewport| {
+        // Compute content_height with viewport known so that scrolling to
+        // ScreenTop (history_lines * row_height) fully hides scrollback.
+        // Without this, the remainder (viewport_h - screen_lines * row_height)
+        // causes a partial scrollback row to "leak" at the top after Ctrl+L.
+        let natural = (row_height_with_spacing * total_lines as f32
+            - ui.spacing().item_spacing.y)
+            .max(0.0);
+        let content_height =
+            natural.max(row_height * history_lines as f32 + viewport.height());
+        ui.set_height(content_height);
+
+        let mut min_row =
+            (viewport.min.y / row_height_with_spacing).floor().max(0.0) as usize;
+        let mut max_row =
+            (viewport.max.y / row_height_with_spacing).ceil().max(0.0) as usize + 1;
+
+        if min_row > total_lines {
+            min_row = total_lines;
+        }
+        if max_row > total_lines {
+            max_row = total_lines;
+        }
+        if min_row > max_row {
+            min_row = max_row;
+        }
+
+        let row_layout = egui::Layout::left_to_right(egui::Align::Min)
+            .with_cross_align(egui::Align::Min);
+        let row_start = min_row;
+
+        let y_min = ui.max_rect().top() + min_row as f32 * row_height_with_spacing;
+        let y_max = ui.max_rect().top() + max_row as f32 * row_height_with_spacing;
+        let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), y_min..=y_max);
+
+        ui.allocate_ui_at_rect(rect, |viewport_ui| {
+            let row_width = viewport_ui.max_rect().width();
+            let base_left = viewport_ui.min_rect().left();
+            let base_top = align_to_pixels(viewport_ui.min_rect().top(), pixels_per_point);
+            for row_idx in min_row..max_row {
                 let line = Line(top_line + row_idx as i32);
                 let row = &grid[line];
                 let mut job = egui::text::LayoutJob::default();
@@ -348,9 +451,22 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
                     };
                     job.append(&display_char.to_string(), 0.0, text_format);
                 }
-                ui.label(job);
+
+                let row_top = base_top + (row_idx - row_start) as f32 * row_height_with_spacing;
+                let rect = egui::Rect::from_min_size(
+                    egui::pos2(base_left, row_top),
+                    egui::vec2(row_width, row_height),
+                );
+
+                viewport_ui.allocate_ui_at_rect(rect, |row_ui| {
+                    row_ui.with_layout(row_layout, |row_ui| {
+                        let label = egui::Label::new(job).wrap(false);
+                        row_ui.add(label);
+                    });
+                });
             }
         });
+    });
 }
 
 pub fn render_vt_log(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {

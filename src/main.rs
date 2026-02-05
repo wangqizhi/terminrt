@@ -20,6 +20,9 @@ const SQUARE_SIZE: f32 = 200.0;
 const FONT_SIZE: f32 = 120.0;
 struct UiState {
     terminal: Option<terminal::TerminalInstance>,
+    terminal_scroll_request: Option<terminal::ScrollRequest>,
+    terminal_scroll_request_frames_left: u8,
+    terminal_scroll_id: u64,
 }
 
 #[repr(C)]
@@ -672,38 +675,53 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
                 egui::vec2(available.x, bottom_h),
             );
 
-            // Resize terminal to match available area
-            if let Some(ref mut term) = ui_state.terminal {
-                let margin = 4.0;
-                let content_w = (top_rect.width() - margin * 2.0).max(0.0);
-                let content_h = (top_rect.height() - margin * 2.0).max(0.0);
-                let font_id = egui::FontId::monospace(terminal::TERM_FONT_SIZE);
-                let row_height = ui.fonts(|f| f.row_height(&font_id));
-                let char_width = ui.fonts(|f| f.glyph_width(&font_id, 'M'));
-                if row_height > 0.0 && char_width > 0.0 {
-                    let new_rows = (content_h / row_height).floor() as u16;
-                    let new_cols = (content_w / char_width).floor() as u16;
-                    if new_rows > 0 && new_cols > 0
-                        && (new_rows as usize != term.rows() || new_cols as usize != term.cols())
-                    {
-                        term.resize(new_rows, new_cols);
-                    }
-                }
-            }
-
             // Top area: terminal display
             ui.allocate_ui_at_rect(top_rect, |ui| {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(18, 18, 18))
-                    .stroke(panel_stroke)
-                    .inner_margin(egui::Margin {
-                        left: 4.0,
-                        right: 4.0,
-                        top: 4.0,
-                        bottom: 4.0,
-                    })
                     .show(ui, |ui| {
-                        terminal::render_terminal(ui, ui_state.terminal.as_ref());
+                        if let Some(term) = ui_state.terminal.as_mut() {
+                            let available = ui.available_size();
+                            let font_id = egui::FontId::monospace(terminal::TERM_FONT_SIZE);
+                            let row_height = terminal::aligned_row_height(ui, &font_id);
+                            let char_width = terminal::aligned_glyph_width(ui, &font_id, 'M');
+                            if row_height > 0.0 && char_width > 0.0 {
+                                let new_rows = (available.y / row_height).floor() as u16;
+                                let new_cols = (available.x / char_width).floor() as u16;
+                                if new_rows > 0
+                                    && new_cols > 0
+                                    && (new_rows as usize != term.rows()
+                                        || new_cols as usize != term.cols())
+                                {
+                                    term.resize(new_rows, new_cols);
+                                    ui_state.terminal_scroll_request =
+                                        Some(terminal::ScrollRequest::ScreenTop);
+                                    ui_state.terminal_scroll_request_frames_left = 30;
+                                    ui_state.terminal_scroll_id =
+                                        ui_state.terminal_scroll_id.wrapping_add(1);
+                                }
+                            }
+                        }
+
+                        let scroll_request = if ui_state.terminal_scroll_request_frames_left > 0 {
+                            ui_state.terminal_scroll_request
+                        } else {
+                            None
+                        };
+
+                        terminal::render_terminal(
+                            ui,
+                            ui_state.terminal.as_ref(),
+                            scroll_request,
+                            ui_state.terminal_scroll_id,
+                        );
+
+                        if ui_state.terminal_scroll_request_frames_left > 0 {
+                            ui_state.terminal_scroll_request_frames_left -= 1;
+                            if ui_state.terminal_scroll_request_frames_left == 0 {
+                                ui_state.terminal_scroll_request = None;
+                            }
+                        }
                     });
             });
 
@@ -802,6 +820,9 @@ fn main() {
     };
     let mut ui_state = UiState {
         terminal: terminal_instance,
+        terminal_scroll_request: Some(terminal::ScrollRequest::ScreenTop),
+        terminal_scroll_request_frames_left: 30,
+        terminal_scroll_id: 0,
     };
 
     let mut current_modifiers = winit::event::Modifiers::default();
@@ -817,6 +838,18 @@ fn main() {
                 // Forward keyboard input to terminal BEFORE egui processes it
                 if let WindowEvent::KeyboardInput { ref event, .. } = event {
                     if let Some(ref terminal) = ui_state.terminal {
+                        let ctrl = current_modifiers.state().control_key();
+                        if ctrl {
+                            if let winit::keyboard::Key::Character(text) = &event.logical_key {
+                                if text.eq_ignore_ascii_case("l") {
+                                    ui_state.terminal_scroll_request =
+                                        Some(terminal::ScrollRequest::ScreenTop);
+                                    ui_state.terminal_scroll_request_frames_left = 60;
+                                    ui_state.terminal_scroll_id = ui_state.terminal_scroll_id.wrapping_add(1);
+                                }
+                            }
+                        }
+
                         if let Some(input_bytes) =
                             terminal::key_to_terminal_input(event, &current_modifiers)
                         {
