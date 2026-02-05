@@ -9,15 +9,15 @@ use winit::{
 };
 
 mod font;
+mod pty;
+mod terminal;
 
-const WINDOW_WIDTH: u32 = 800;
-const WINDOW_HEIGHT: u32 = 600;
+const WINDOW_WIDTH: u32 = 1024;
+const WINDOW_HEIGHT: u32 = 768;
 const SQUARE_SIZE: f32 = 200.0;
 const FONT_SIZE: f32 = 120.0;
-
 struct UiState {
-    input: String,
-    output: String,
+    terminal: Option<terminal::TerminalInstance>,
 }
 
 #[repr(C)]
@@ -660,30 +660,26 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
                 egui::vec2(available.x, bottom_h),
             );
 
+            // Top area: terminal display
             ui.allocate_ui_at_rect(top_rect, |ui| {
                 egui::Frame::none()
-                    .fill(egui::Color32::from_gray(28))
+                    .fill(egui::Color32::from_rgb(18, 18, 18))
                     .stroke(panel_stroke)
                     .inner_margin(egui::Margin {
-                        left: 8.0,
-                        right: 8.0,
-                        top: 8.0,
-                        bottom: 8.0,
+                        left: 4.0,
+                        right: 4.0,
+                        top: 4.0,
+                        bottom: 4.0,
                     })
                     .show(ui, |ui| {
-                        let text = if ui_state.output.is_empty() {
-                            "Output will appear here."
-                        } else {
-                            ui_state.output.as_str()
-                        };
-                        ui.label(egui::RichText::new(text).color(egui::Color32::WHITE));
+                        terminal::render_terminal(ui, ui_state.terminal.as_ref());
                     });
             });
 
+            // Bottom area: status/info
             ui.allocate_ui_at_rect(bottom_rect, |ui| {
                 egui::Frame::none()
                     .fill(egui::Color32::from_gray(24))
-                    .stroke(panel_stroke)
                     .inner_margin(egui::Margin {
                         left: 8.0,
                         right: 8.0,
@@ -691,23 +687,39 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
                         bottom: 8.0,
                     })
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            let button_width = 80.0;
-                            let edit_width = (ui.available_width() - button_width - 8.0).max(80.0);
-                            let edit = ui.add_sized(
-                                [edit_width, 24.0],
-                                egui::TextEdit::singleline(&mut ui_state.input),
-                            );
-                            let clicked = ui.button("Render").clicked();
-                            let enter_pressed =
-                                edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                            if clicked || enter_pressed {
-                                ui_state.output = ui_state.input.clone();
-                            }
-                        });
+                        let status = if ui_state.terminal.is_some() {
+                            "Terminal: connected"
+                        } else {
+                            "Terminal: not connected"
+                        };
+                        ui.label(
+                            egui::RichText::new(status)
+                                .color(egui::Color32::from_gray(120))
+                                .monospace()
+                                .size(12.0),
+                        );
                     });
             });
         });
+}
+
+fn load_system_chinese_font() -> Option<Vec<u8>> {
+    let font_paths = [
+        "C:\\Windows\\Fonts\\msyh.ttc",
+        "C:\\Windows\\Fonts\\msyhbd.ttc",
+        "C:\\Windows\\Fonts\\msyhl.ttc",
+        "C:\\Windows\\Fonts\\simhei.ttf",
+        "C:\\Windows\\Fonts\\simsun.ttc",
+        "C:\\Windows\\Fonts\\simkai.ttf",
+    ];
+
+    for path in font_paths {
+        if let Ok(data) = std::fs::read(path) {
+            return Some(data);
+        }
+    }
+
+    None
 }
 
 fn main() {
@@ -722,6 +734,21 @@ fn main() {
 
     let mut state = pollster::block_on(State::new(window.clone()));
     let egui_ctx = egui::Context::default();
+    if let Some(font_data) = load_system_chinese_font() {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert("zh".to_string(), egui::FontData::from_owned(font_data));
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Proportional)
+            .unwrap()
+            .insert(0, "zh".to_string());
+        fonts
+            .families
+            .get_mut(&egui::FontFamily::Monospace)
+            .unwrap()
+            .insert(0, "zh".to_string());
+        egui_ctx.set_fonts(fonts);
+    }
     let mut egui_state = egui_winit::State::new(
         egui_ctx.clone(),
         egui::ViewportId::ROOT,
@@ -730,22 +757,54 @@ fn main() {
         None,
     );
     let mut egui_renderer = egui_wgpu::Renderer::new(&state.device, state.config.format, None, 1);
+
+    // Initialize the terminal with default size (will be resized later)
+    let terminal_instance = match terminal::TerminalInstance::new(24, 80) {
+        Ok(t) => {
+            eprintln!("Terminal started successfully");
+            Some(t)
+        }
+        Err(e) => {
+            eprintln!("Failed to start terminal: {}", e);
+            None
+        }
+    };
     let mut ui_state = UiState {
-        input: String::new(),
-        output: String::new(),
+        terminal: terminal_instance,
     };
 
-    event_loop.run(move |event, elwt| {
+    let mut current_modifiers = winit::event::Modifiers::default();
+
+    let _ = event_loop.run(move |event, elwt| {
         match event {
             Event::WindowEvent { event, window_id } if window_id == state.window().id() => {
-                let response = egui_state.on_window_event(window.as_ref(), &event);
-                if response.consumed {
-                    return;
+                // Track modifier state
+                if let WindowEvent::ModifiersChanged(mods) = &event {
+                    current_modifiers = mods.clone();
                 }
+
+                // Forward keyboard input to terminal BEFORE egui processes it
+                if let WindowEvent::KeyboardInput { ref event, .. } = event {
+                    if let Some(ref terminal) = ui_state.terminal {
+                        if let Some(input_bytes) =
+                            terminal::key_to_terminal_input(event, &current_modifiers)
+                        {
+                            terminal.write_to_pty(&input_bytes);
+                        }
+                    }
+                }
+
+                let response = egui_state.on_window_event(window.as_ref(), &event);
+                let _ = response;
                 match event {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(size) => state.resize(size),
                     WindowEvent::RedrawRequested => {
+                        // Process PTY output before rendering
+                        if let Some(ref mut terminal) = ui_state.terminal {
+                            terminal.process_input();
+                        }
+
                         let raw_input = egui_state.take_egui_input(window.as_ref());
                         let full_output = egui_ctx.run(raw_input, |ctx| {
                             build_ui(ctx, &mut ui_state);
