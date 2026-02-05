@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -15,6 +16,7 @@ use winit::keyboard::{Key, NamedKey};
 use crate::pty::{self, PtySize, PtyWriter};
 
 pub const TERM_FONT_SIZE: f32 = 14.0;
+const VT_LOG_MAX_LINES: usize = 2000;
 
 #[derive(Copy, Clone)]
 struct TermDims {
@@ -39,6 +41,8 @@ pub struct TerminalInstance {
     processor: ansi::Processor,
     rx: mpsc::Receiver<Vec<u8>>,
     pty_writer: Arc<Mutex<PtyWriter>>,
+    vt_lines: VecDeque<String>,
+    vt_pending: String,
     _reader_thread: thread::JoinHandle<()>,
 }
 
@@ -79,6 +83,8 @@ impl TerminalInstance {
             processor,
             rx,
             pty_writer,
+            vt_lines: VecDeque::new(),
+            vt_pending: String::new(),
             _reader_thread: reader_thread,
         })
     }
@@ -86,6 +92,7 @@ impl TerminalInstance {
     /// Process pending PTY output, feeding bytes into the terminal emulator.
     pub fn process_input(&mut self) {
         while let Ok(data) = self.rx.try_recv() {
+            self.append_vt_log(&data);
             self.processor.advance(&mut self.term, &data);
         }
     }
@@ -120,6 +127,71 @@ impl TerminalInstance {
 
     pub fn cols(&self) -> usize {
         self.term.columns()
+    }
+
+    pub fn vt_log_lines_len(&self) -> usize {
+        self.vt_lines.len() + if self.vt_pending.is_empty() { 0 } else { 1 }
+    }
+
+    pub fn vt_log_line(&self, index: usize) -> Option<&str> {
+        if index < self.vt_lines.len() {
+            return self.vt_lines.get(index).map(|line| line.as_str());
+        }
+        if !self.vt_pending.is_empty() && index == self.vt_lines.len() {
+            return Some(self.vt_pending.as_str());
+        }
+        None
+    }
+
+    fn append_vt_log(&mut self, data: &[u8]) {
+        if let Ok(text) = std::str::from_utf8(data) {
+            for ch in text.chars() {
+                self.push_vt_char(ch);
+            }
+        } else {
+            for &byte in data {
+                self.push_vt_byte(byte);
+            }
+        }
+    }
+
+    fn push_vt_char(&mut self, ch: char) {
+        match ch {
+            '\n' => {
+                self.vt_pending.push_str("\\n");
+                self.push_vt_line();
+            }
+            '\r' => self.vt_pending.push_str("\\r"),
+            '\t' => self.vt_pending.push_str("\\t"),
+            '\u{1b}' => self.vt_pending.push_str("\\x1b"),
+            c if c.is_control() => {
+                let code = c as u32;
+                self.vt_pending.push_str(&format!("\\u{{{:04X}}}", code));
+            }
+            _ => self.vt_pending.push(ch),
+        }
+    }
+
+    fn push_vt_byte(&mut self, byte: u8) {
+        match byte {
+            b'\n' => {
+                self.vt_pending.push_str("\\n");
+                self.push_vt_line();
+            }
+            b'\r' => self.vt_pending.push_str("\\r"),
+            b'\t' => self.vt_pending.push_str("\\t"),
+            0x1b => self.vt_pending.push_str("\\x1b"),
+            0x20..=0x7e => self.vt_pending.push(byte as char),
+            _ => self.vt_pending.push_str(&format!("\\x{:02X}", byte)),
+        }
+    }
+
+    fn push_vt_line(&mut self) {
+        let line = std::mem::take(&mut self.vt_pending);
+        self.vt_lines.push_back(line);
+        while self.vt_lines.len() > VT_LOG_MAX_LINES {
+            self.vt_lines.pop_front();
+        }
     }
 }
 
@@ -211,8 +283,12 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
     let grid = term.grid();
     let content = term.renderable_content();
     let cursor = content.cursor;
-    let num_lines = term.screen_lines();
     let num_cols = term.columns();
+    let total_lines = grid.total_lines();
+    let history_lines = grid.history_size();
+    let top_line = -(history_lines as i32);
+    let font_id = egui::FontId::monospace(TERM_FONT_SIZE);
+    let row_height = ui.fonts(|f| f.row_height(&font_id)).max(1.0);
 
     // Cursor blink: 500ms on / 500ms off
     let cursor_visible = {
@@ -225,10 +301,11 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
 
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
-        .show(ui, |ui| {
+        .stick_to_bottom(true)
+        .show_rows(ui, row_height, total_lines, |ui, row_range| {
             ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
-            for line_idx in 0..num_lines {
-                let line = Line(line_idx as i32);
+            for row_idx in row_range {
+                let line = Line(top_line + row_idx as i32);
                 let row = &grid[line];
                 let mut job = egui::text::LayoutJob::default();
 
@@ -261,7 +338,7 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
                     };
 
                     let text_format = egui::TextFormat {
-                        font_id: egui::FontId::monospace(TERM_FONT_SIZE),
+                        font_id: font_id.clone(),
                         color: fg,
                         background: bg,
                         ..Default::default()
@@ -269,6 +346,43 @@ pub fn render_terminal(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
                     job.append(&display_char.to_string(), 0.0, text_format);
                 }
                 ui.label(job);
+            }
+        });
+}
+
+pub fn render_vt_log(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
+    let terminal = match terminal {
+        Some(t) => t,
+        None => {
+            ui.label(
+                egui::RichText::new("VT log not available.")
+                    .color(egui::Color32::from_gray(120))
+                    .monospace(),
+            );
+            return;
+        }
+    };
+
+    let total_lines = terminal.vt_log_lines_len();
+    let font_id = egui::FontId::monospace(12.0);
+    let row_height = ui.fonts(|f| f.row_height(&font_id)).max(1.0);
+
+    egui::ScrollArea::both()
+        .auto_shrink([false, false])
+        .stick_to_bottom(true)
+        .show_rows(ui, row_height, total_lines, |ui, row_range| {
+            ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
+            for row_idx in row_range {
+                let Some(line) = terminal.vt_log_line(row_idx) else {
+                    continue;
+                };
+                let label = egui::Label::new(
+                    egui::RichText::new(line)
+                        .monospace()
+                        .color(egui::Color32::from_gray(170)),
+                )
+                .wrap(false);
+                ui.add(label);
             }
         });
 }

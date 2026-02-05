@@ -644,7 +644,17 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
         .resizable(false)
         .exact_width(side_w)
         .frame(egui::Frame::none().fill(side_fill).stroke(panel_stroke))
-        .show(ctx, |_ui| {});
+        .show(ctx, |ui| {
+            ui.add_space(6.0);
+            ui.label(
+                egui::RichText::new("VT Stream")
+                    .color(egui::Color32::from_gray(180))
+                    .monospace()
+                    .size(12.0),
+            );
+            ui.add_space(6.0);
+            terminal::render_vt_log(ui, ui_state.terminal.as_ref());
+        });
 
     egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(center_fill).stroke(panel_stroke))
