@@ -1,0 +1,20 @@
+# Rust
+/target
+
+# System
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# AI Agent
+.claude/
+.cursor/
+.aider*
+.copilot/

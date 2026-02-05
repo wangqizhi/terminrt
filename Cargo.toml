@@ -1,0 +1,14 @@
+[package]
+name = "terminrt"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+winit = "0.29"
+wgpu = "0.19"
+fontdue = "0.8"
+bytemuck = { version = "1.14", features = ["derive"] }
+pollster = "0.3"
+egui = "0.27"
+egui-winit = "0.27"
+egui-wgpu = "0.27"
