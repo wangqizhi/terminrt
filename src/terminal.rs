@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -62,9 +63,9 @@ pub struct TerminalInstance {
 }
 
 impl TerminalInstance {
-    pub fn new(rows: u16, cols: u16) -> io::Result<Self> {
+    pub fn new(rows: u16, cols: u16, startup_dir: PathBuf) -> io::Result<Self> {
         let size = PtySize { rows, cols };
-        let (mut reader, writer) = pty::spawn_pty(size)?;
+        let (mut reader, writer) = pty::spawn_pty(size, &startup_dir)?;
         let pty_writer = Arc::new(Mutex::new(writer));
 
         let (tx, rx) = mpsc::channel::<Vec<u8>>();
@@ -101,9 +102,7 @@ impl TerminalInstance {
             vt_lines: VecDeque::new(),
             vt_pending: String::new(),
             osc_tracking_buffer: Vec::new(),
-            current_dir: std::env::current_dir()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|_| ".".to_string()),
+            current_dir: startup_dir.display().to_string(),
             _reader_thread: reader_thread,
         })
     }

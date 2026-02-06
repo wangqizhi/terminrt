@@ -6,6 +6,7 @@ pub struct PtySize {
 #[cfg(windows)]
 mod platform {
     use std::io::{self, Read, Write};
+    use std::path::Path;
 
     /// Readable end of the PTY — goes to the background reader thread.
     pub struct PtyReader {
@@ -39,13 +40,14 @@ mod platform {
         }
     }
 
-    pub fn spawn(size: super::PtySize) -> io::Result<(PtyReader, PtyWriter)> {
+    pub fn spawn(size: super::PtySize, startup_dir: &Path) -> io::Result<(PtyReader, PtyWriter)> {
         let mut shell = std::process::Command::new("powershell.exe");
         shell
             .arg("-NoLogo")
             .arg("-NoExit")
             .arg("-Command")
-            .arg("function global:prompt { $p=(Get-Location).Path; $esc=[char]27; $bel=[char]7; Write-Host -NoNewline ($esc + ']633;CWD=' + $p + $bel); '> ' }");
+            .arg("function global:prompt { $p=(Get-Location).Path; $esc=[char]27; $bel=[char]7; Write-Host -NoNewline ($esc + ']633;CWD=' + $p + $bel); '> ' }")
+            .current_dir(startup_dir);
 
         let mut process = conpty::ProcessOptions::default()
             .set_console_size(Some((size.cols as i16, size.rows as i16)))
@@ -66,6 +68,7 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use std::io;
+    use std::path::Path;
 
     pub struct PtyReader;
 
@@ -87,7 +90,7 @@ mod platform {
         }
     }
 
-    pub fn spawn(_size: super::PtySize) -> io::Result<(PtyReader, PtyWriter)> {
+    pub fn spawn(_size: super::PtySize, _startup_dir: &Path) -> io::Result<(PtyReader, PtyWriter)> {
         // TODO: implement Unix PTY (e.g. using nix or rustix)
         Err(io::Error::new(
             io::ErrorKind::Unsupported,

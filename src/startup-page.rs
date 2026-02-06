@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-const TEXT: &str = "HELLOWORLD";
+const TEXT: &str = "HELLO TERMINRT!";
 const CHAR_STEP_SECS: f32 = 0.12;
 const CHAR_FADE_SECS: f32 = 0.26;
 const END_HOLD_SECS: f32 = 0.16;

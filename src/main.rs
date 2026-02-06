@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use egui_wgpu::ScreenDescriptor;
+use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Instant;
@@ -754,39 +755,32 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
         .show(ctx, |ui| {
             let origin = ui.min_rect().min;
             let available = ui.available_size();
-            let prompt_h = 30.0; // Top prompt bar
-            let bottom_h = 28.0; // Fixed height: just enough for status text
-            let terminal_h = (available.y - prompt_h - bottom_h).max(0.0);
+
+            // ── Unified status bar parameters (adjust these to tune) ──
+            let bar_h: f32 = 22.0;        // 状态栏高度（上下共用）
+            let bar_pad: f32 = 14.0;       // 状态栏与终端之间的间距（上下共用）
+            let bar_fade: f32 = 30.0;      // 渐变长度（上下共用）
+            let bar_gray: u8 = 26;         // 状态栏底色灰度（上下共用）
+            // ───────────────────────────────────────────────────────────
+
+            let prompt_h = bar_h;
+            let term_top_pad = bar_pad;
+            let term_bot_pad = bar_pad;
+            let bottom_h = bar_h;
+            let terminal_h = (available.y - prompt_h - term_top_pad - term_bot_pad - bottom_h).max(0.0);
 
             let prompt_rect = egui::Rect::from_min_size(origin, egui::vec2(available.x, prompt_h));
             let terminal_rect = egui::Rect::from_min_size(
-                egui::pos2(origin.x, origin.y + prompt_h),
+                egui::pos2(origin.x, origin.y + prompt_h + term_top_pad),
                 egui::vec2(available.x, terminal_h),
             );
             let bottom_rect = egui::Rect::from_min_size(
-                egui::pos2(origin.x, origin.y + prompt_h + terminal_h),
+                egui::pos2(origin.x, origin.y + prompt_h + term_top_pad + terminal_h + term_bot_pad),
                 egui::vec2(available.x, bottom_h),
             );
 
-            // Top area: command prompt
-            ui.allocate_ui_at_rect(prompt_rect, |ui| {
-                let prompt_label = if let Some(term) = ui_state.terminal.as_ref() {
-                    format!("PS {}", term.current_dir())
-                } else {
-                    "PS .".to_string()
-                };
-                egui::Frame::none()
-                    .fill(egui::Color32::from_gray(22))
-                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(prompt_label)
-                                .color(egui::Color32::from_gray(210))
-                                .monospace()
-                                .size(14.0),
-                        );
-                    });
-            });
+            // Top area: reserve space (text painted later on top layer)
+            ui.allocate_ui_at_rect(prompt_rect, |_ui| {});
 
             // Middle area: terminal display
             ui.allocate_ui_at_rect(terminal_rect, |ui| {
@@ -864,42 +858,109 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
                     });
             });
 
-            // Bottom area: status/info
-            ui.allocate_ui_at_rect(bottom_rect, |ui| {
-                egui::Frame::none()
-                    .fill(egui::Color32::from_gray(24))
-                    .inner_margin(egui::Margin {
-                        left: 8.0,
-                        right: 8.0,
-                        top: 8.0,
-                        bottom: 8.0,
-                    })
-                    .show(ui, |ui| {
-                        let connect_status = if ui_state.terminal.is_some() {
-                            "connected"
-                        } else if ui_state.terminal_init_error.is_some() {
-                            "failed"
-                        } else {
-                            "starting"
-                        };
-                        let status = format!(
-                            "Terminal: {} | View: {:.0}x{:.0}px | PTY: {:.0}x{:.0}px ({}x{} cells)",
-                            connect_status,
-                            ui_state.terminal_view_size_px.x,
-                            ui_state.terminal_view_size_px.y,
-                            ui_state.pty_render_size_px.x,
-                            ui_state.pty_render_size_px.y,
-                            ui_state.pty_grid_size.0,
-                            ui_state.pty_grid_size.1,
-                        );
-                        ui.label(
-                            egui::RichText::new(status)
-                                .color(egui::Color32::from_gray(120))
-                                .monospace()
-                                .size(12.0),
-                        );
-                    });
-            });
+            // Bottom area: reserve space (text painted later on top layer)
+            ui.allocate_ui_at_rect(bottom_rect, |_ui| {});
+
+            // --- Layer 1 (Foreground): gradient overlays on top of terminal content ---
+            let fg_layer = egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("gradient_overlays"),
+            );
+            let fg_painter = ui.ctx().layer_painter(fg_layer);
+
+            // Expand rects by 1px on each side to cover panel stroke edges
+            let prompt_fill = prompt_rect.expand(1.0);
+            let bottom_fill = bottom_rect.expand(1.0);
+
+            let bar_color = egui::Color32::from_gray(bar_gray);
+            let bar_transparent = egui::Color32::from_rgba_unmultiplied(bar_gray, bar_gray, bar_gray, 0);
+
+            // Top prompt bar solid background
+            fg_painter.rect_filled(prompt_fill, 0.0, bar_color);
+
+            // Top gradient: solid → transparent (downward)
+            {
+                let grad_top = prompt_rect.bottom();
+                let grad_bottom = grad_top + bar_fade;
+                let mut mesh = egui::Mesh::default();
+                mesh.colored_vertex(egui::pos2(prompt_fill.left(), grad_top), bar_color);
+                mesh.colored_vertex(egui::pos2(prompt_fill.right(), grad_top), bar_color);
+                mesh.colored_vertex(egui::pos2(prompt_fill.right(), grad_bottom), bar_transparent);
+                mesh.colored_vertex(egui::pos2(prompt_fill.left(), grad_bottom), bar_transparent);
+                mesh.add_triangle(0, 1, 2);
+                mesh.add_triangle(0, 2, 3);
+                fg_painter.add(egui::Shape::mesh(mesh));
+            }
+
+            // Bottom status bar solid background
+            fg_painter.rect_filled(bottom_fill, 0.0, bar_color);
+
+            // Bottom gradient: transparent → solid (upward)
+            {
+                let grad_bottom = bottom_rect.top();
+                let grad_top = grad_bottom - bar_fade;
+                let mut mesh = egui::Mesh::default();
+                mesh.colored_vertex(egui::pos2(bottom_fill.left(), grad_top), bar_transparent);
+                mesh.colored_vertex(egui::pos2(bottom_fill.right(), grad_top), bar_transparent);
+                mesh.colored_vertex(egui::pos2(bottom_fill.right(), grad_bottom), bar_color);
+                mesh.colored_vertex(egui::pos2(bottom_fill.left(), grad_bottom), bar_color);
+                mesh.add_triangle(0, 1, 2);
+                mesh.add_triangle(0, 2, 3);
+                fg_painter.add(egui::Shape::mesh(mesh));
+            }
+
+            // --- Layer 2 (Tooltip): text labels on top of gradients ---
+            let text_layer = egui::LayerId::new(
+                egui::Order::Tooltip,
+                egui::Id::new("overlay_text"),
+            );
+            let text_painter = ui.ctx().layer_painter(text_layer);
+
+            // Top prompt text
+            {
+                let prompt_label = if let Some(term) = ui_state.terminal.as_ref() {
+                    format!("PS {}", term.current_dir())
+                } else {
+                    "PS .".to_string()
+                };
+                let font_id = egui::FontId::monospace(14.0);
+                let galley = text_painter.layout_no_wrap(
+                    prompt_label,
+                    font_id,
+                    egui::Color32::from_gray(210),
+                );
+                let text_pos = egui::pos2(prompt_rect.left() + 8.0, prompt_rect.top() + 4.0);
+                text_painter.galley(text_pos, galley, egui::Color32::from_gray(210));
+            }
+
+            // Bottom status text
+            {
+                let connect_status = if ui_state.terminal.is_some() {
+                    "connected"
+                } else if ui_state.terminal_init_error.is_some() {
+                    "failed"
+                } else {
+                    "starting"
+                };
+                let status = format!(
+                    "Terminal: {} | View: {:.0}x{:.0}px | PTY: {:.0}x{:.0}px ({}x{} cells)",
+                    connect_status,
+                    ui_state.terminal_view_size_px.x,
+                    ui_state.terminal_view_size_px.y,
+                    ui_state.pty_render_size_px.x,
+                    ui_state.pty_render_size_px.y,
+                    ui_state.pty_grid_size.0,
+                    ui_state.pty_grid_size.1,
+                );
+                let font_id = egui::FontId::monospace(12.0);
+                let galley = text_painter.layout_no_wrap(
+                    status,
+                    font_id,
+                    egui::Color32::from_gray(120),
+                );
+                let text_pos = egui::pos2(bottom_rect.left() + 8.0, bottom_rect.top() + 8.0);
+                text_painter.galley(text_pos, galley, egui::Color32::from_gray(120));
+            }
         });
 }
 
@@ -923,6 +984,8 @@ fn load_system_chinese_font() -> Option<Vec<u8>> {
 }
 
 fn main() {
+    let startup_dir = resolve_startup_dir();
+
     let event_loop = EventLoop::new().expect("event loop");
     let window = Arc::new(
         WindowBuilder::new()
@@ -944,12 +1007,12 @@ fn main() {
             .families
             .get_mut(&egui::FontFamily::Proportional)
             .unwrap()
-            .insert(0, "zh".to_string());
+            .push("zh".to_string());
         fonts
             .families
             .get_mut(&egui::FontFamily::Monospace)
             .unwrap()
-            .insert(0, "zh".to_string());
+            .push("zh".to_string());
         egui_ctx.set_fonts(fonts);
     }
     let mut egui_state = egui_winit::State::new(
@@ -964,7 +1027,7 @@ fn main() {
     let (terminal_init_tx, terminal_init_rx) =
         mpsc::channel::<std::io::Result<terminal::TerminalInstance>>();
     thread::spawn(move || {
-        let result = terminal::TerminalInstance::new(24, 80);
+        let result = terminal::TerminalInstance::new(24, 80, startup_dir);
         let _ = terminal_init_tx.send(result);
     });
 
@@ -1125,4 +1188,14 @@ fn main() {
             _ => {}
         }
     });
+}
+
+fn resolve_startup_dir() -> PathBuf {
+    let default_dir = PathBuf::from("C:\\");
+    let arg_dir = std::env::args_os().nth(1).map(PathBuf::from);
+
+    match arg_dir {
+        Some(path) if path.is_dir() => path,
+        _ => default_dir,
+    }
 }
