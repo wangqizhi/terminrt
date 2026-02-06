@@ -1251,28 +1251,27 @@ fn main() {
                     if let Some(ref terminal) = ui_state.terminal {
                         if !ui_state.close_confirm_open && !ui_state.terminal_exited {
                         let ctrl = current_modifiers.state().control_key();
-                        let mut skip_cursor_follow = false;
-                        if ctrl {
-                            if let winit::keyboard::Key::Character(text) = &event.logical_key {
-                                if text.eq_ignore_ascii_case("l") {
-                                    ui_state.terminal_scroll_request =
-                                        Some(terminal::ScrollRequest::ScreenTop);
-                                    ui_state.terminal_scroll_request_frames_left = 60;
-                                    ui_state.terminal_scroll_id =
-                                        ui_state.terminal_scroll_id.wrapping_add(1);
-                                    skip_cursor_follow = true;
-                                }
-                            }
-                        }
+                        let is_ctrl_l = ctrl
+                            && matches!(
+                                &event.logical_key,
+                                winit::keyboard::Key::Character(text) if text.eq_ignore_ascii_case("l")
+                            );
 
-                        if let Some(input_bytes) =
+                        if is_ctrl_l {
+                            if event.state.is_pressed() && !event.repeat {
+                                ui_state.terminal_scroll_request =
+                                    Some(terminal::ScrollRequest::ScreenTop);
+                                ui_state.terminal_scroll_request_frames_left = 60;
+                                ui_state.terminal_scroll_id =
+                                    ui_state.terminal_scroll_id.wrapping_add(1);
+                                terminal.write_to_pty(&[0x0c]);
+                            }
+                        } else if let Some(input_bytes) =
                             terminal::key_to_terminal_input(event, &current_modifiers)
                         {
-                            if !skip_cursor_follow {
-                                ui_state.terminal_scroll_request =
-                                    Some(terminal::ScrollRequest::CursorLine);
-                                ui_state.terminal_scroll_request_frames_left = 1;
-                            }
+                            ui_state.terminal_scroll_request =
+                                Some(terminal::ScrollRequest::CursorLine);
+                            ui_state.terminal_scroll_request_frames_left = 1;
                             terminal.write_to_pty(&input_bytes);
                         }
                         }
@@ -1392,9 +1391,18 @@ fn main() {
                         if let Some(ref mut terminal) = ui_state.terminal {
                             let process_result = terminal.process_input();
                             if process_result.had_input {
-                                ui_state.terminal_scroll_request =
-                                    Some(terminal::ScrollRequest::CursorLine);
-                                ui_state.terminal_scroll_request_frames_left = 1;
+                                // Don't downgrade a ScreenTop request (e.g. from Ctrl+L) to
+                                // CursorLine – the ScreenTop scroll must persist for its full
+                                // frame budget so the viewport stays at the right position.
+                                let has_screen_top = matches!(
+                                    ui_state.terminal_scroll_request,
+                                    Some(terminal::ScrollRequest::ScreenTop)
+                                ) && ui_state.terminal_scroll_request_frames_left > 0;
+                                if !has_screen_top {
+                                    ui_state.terminal_scroll_request =
+                                        Some(terminal::ScrollRequest::CursorLine);
+                                    ui_state.terminal_scroll_request_frames_left = 1;
+                                }
                             }
                             if process_result.pty_closed || !terminal.is_alive() {
                                 ui_state.terminal_exited = true;
