@@ -19,8 +19,8 @@ mod pty;
 mod startup_page;
 mod terminal;
 
-const WINDOW_WIDTH: u32 = 1024;
-const WINDOW_HEIGHT: u32 = 768;
+const WINDOW_WIDTH: u32 = 1638;
+const WINDOW_HEIGHT: u32 = 1024;
 const SQUARE_SIZE: f32 = 200.0;
 const FONT_SIZE: f32 = 120.0;
 const LEFT_PANEL_WIDTH: f32 = 260.0;
@@ -901,9 +901,10 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) -> Option<egui::Rect> {
             let terminal_h = (available.y - prompt_h - term_top_pad - term_bot_pad - bottom_h).max(0.0);
 
             let prompt_rect = egui::Rect::from_min_size(origin, egui::vec2(available.x, prompt_h));
+            let term_left_pad: f32 = 8.0;
             let terminal_rect = egui::Rect::from_min_size(
-                egui::pos2(origin.x, origin.y + prompt_h + term_top_pad),
-                egui::vec2(available.x, terminal_h),
+                egui::pos2(origin.x + term_left_pad, origin.y + prompt_h + term_top_pad),
+                egui::vec2((available.x - term_left_pad).max(0.0), terminal_h),
             );
             let bottom_rect = egui::Rect::from_min_size(
                 egui::pos2(origin.x, origin.y + prompt_h + term_top_pad + terminal_h + term_bot_pad),

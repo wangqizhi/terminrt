@@ -60,7 +60,7 @@ pub fn render(ui: &mut egui::Ui, started_at: Instant, error: Option<&str>) {
     let status = if let Some(err) = error {
         format!("PTY start failed: {}", err)
     } else {
-        "Initializing terminal...".to_string()
+        "Initializing terminal... dev by wqz".to_string()
     };
     let status_color = if error.is_some() {
         egui::Color32::from_rgb(220, 90, 90)
