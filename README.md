@@ -71,9 +71,7 @@ src/
 | Shortcut | Action |
 |---|---|
 | `Ctrl+L` | Scroll to screen top |
-| `Ctrl+C` | Copy selected text / Send interrupt |
-| `Ctrl+V` | Paste from clipboard |
-| `Ctrl+Q` / `Alt+F4` | Close (with confirmation) |
+| `Alt+F4` | Close (with confirmation) |
 
 ## License
 
