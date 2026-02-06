@@ -475,6 +475,7 @@ pub fn render_terminal(
     ui: &mut egui::Ui,
     terminal: Option<&TerminalInstance>,
     selection_state: &mut TerminalSelectionState,
+    input_blocked: bool,
     scroll_request: Option<ScrollRequest>,
     scroll_id: u64,
 ) -> Option<egui::Rect> {
@@ -624,31 +625,37 @@ pub fn render_terminal(
             Some((row, col))
         };
 
-        ui.input(|i| {
-            let pointer = &i.pointer;
+        if !input_blocked {
+            ui.input(|i| {
+                let pointer = &i.pointer;
 
-            if pointer.button_pressed(egui::PointerButton::Primary) {
-                if let Some((row, col)) = pointer.interact_pos().and_then(to_cell) {
-                    selection_state.start(row, col);
+                if pointer.button_pressed(egui::PointerButton::Primary) {
+                    if let Some((row, col)) = pointer.interact_pos().and_then(to_cell) {
+                        selection_state.start(row, col);
+                    }
                 }
-            }
 
-            if selection_state.dragging && pointer.button_down(egui::PointerButton::Primary) {
-                if let Some((row, col)) = pointer.interact_pos().and_then(to_cell) {
-                    selection_state.update(row, col);
+                if selection_state.dragging && pointer.button_down(egui::PointerButton::Primary) {
+                    if let Some((row, col)) = pointer.interact_pos().and_then(to_cell) {
+                        selection_state.update(row, col);
+                    }
                 }
-            }
 
-            if pointer.button_released(egui::PointerButton::Primary) && selection_state.dragging {
-                if let Some((row, col)) = pointer.interact_pos().and_then(to_cell) {
-                    selection_state.update(row, col);
+                if pointer.button_released(egui::PointerButton::Primary)
+                    && selection_state.dragging
+                {
+                    if let Some((row, col)) = pointer.interact_pos().and_then(to_cell) {
+                        selection_state.update(row, col);
+                    }
+                    if !selection_state.has_selection() {
+                        selection_state.clear();
+                    }
+                    selection_state.stop_dragging();
                 }
-                if !selection_state.has_selection() {
-                    selection_state.clear();
-                }
-                selection_state.stop_dragging();
-            }
-        });
+            });
+        } else if selection_state.dragging {
+            selection_state.stop_dragging();
+        }
 
         let row_layout =
             egui::Layout::left_to_right(egui::Align::Min).with_cross_align(egui::Align::Min);

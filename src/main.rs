@@ -40,6 +40,9 @@ struct UiState {
     pty_grid_size: (usize, usize),
     loading_started_at: Instant,
     startup_dir: PathBuf,
+    close_confirm_open: bool,
+    close_confirmed: bool,
+    close_focus_pending: bool,
 }
 
 #[repr(C)]
@@ -719,6 +722,95 @@ fn spawn_terminal_async(
     terminal_init_rx
 }
 
+fn show_close_confirm_dialog(ctx: &egui::Context, ui_state: &mut UiState) {
+    if !ui_state.close_confirm_open {
+        return;
+    }
+
+    // Draw a dim background behind the confirmation window.
+    // Keep this layer non-interactive to avoid stealing pointer events
+    // from the dialog buttons and drag handle.
+    let screen_rect = ctx.screen_rect();
+    let blocker_layer = egui::LayerId::new(
+        egui::Order::Middle,
+        egui::Id::new("close_confirm_modal_blocker"),
+    );
+    ctx.layer_painter(blocker_layer).rect_filled(
+        screen_rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 70),
+    );
+
+    let window_size = egui::vec2(270.0, 130.0);
+    let center = screen_rect.center();
+    let default_pos = egui::pos2(
+        center.x - window_size.x * 0.5,
+        center.y - window_size.y * 0.5,
+    );
+
+    egui::Window::new("Confirm Close")
+        .id(egui::Id::new("close_confirm_dialog"))
+        .collapsible(false)
+        .resizable(false)
+        .fixed_size(window_size)
+        .default_pos(default_pos)
+        .movable(true)
+        .show(ctx, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(10.0, 8.0);
+
+            egui::Frame::none()
+                .fill(egui::Color32::from_rgb(24, 24, 24))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(70)))
+                .rounding(egui::Rounding::same(8.0))
+                .inner_margin(egui::Margin::symmetric(12.0, 10.0))
+                .show(ui, |ui| {
+                    ui.set_min_size(egui::vec2(250.0, 105.0));
+
+                    ui.label(
+                        egui::RichText::new("Are you sure you want to close this window?")
+                            .size(16.0)
+                            .strong(),
+                    );
+                    ui.label(
+                        egui::RichText::new("Your current terminal session will be interrupted.")
+                            .size(13.0),
+                    );
+
+                    ui.add_space(6.0);
+                    let button_w = 92.0;
+                    let button_h = 30.0;
+                    let total_buttons_w = button_w * 2.0 + ui.spacing().item_spacing.x;
+                    let left_pad = ((ui.available_width() - total_buttons_w) * 0.5).max(0.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(left_pad);
+                        let close_button = egui::Button::new(
+                            egui::RichText::new("Close")
+                                .color(egui::Color32::WHITE)
+                                .strong(),
+                        )
+                        .min_size(egui::vec2(button_w, button_h))
+                        .fill(egui::Color32::from_rgb(45, 125, 235))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(90, 160, 255)));
+                        let close_response = ui.add(close_button);
+                        if ui_state.close_focus_pending {
+                            close_response.request_focus();
+                            ui_state.close_focus_pending = false;
+                        }
+                        if close_response.clicked() {
+                            ui_state.close_confirm_open = false;
+                            ui_state.close_confirmed = true;
+                        }
+
+                        let cancel_button =
+                            egui::Button::new("Cancel").min_size(egui::vec2(button_w, button_h));
+                        if ui.add(cancel_button).clicked() {
+                            ui_state.close_confirm_open = false;
+                        }
+                    });
+                });
+        });
+}
+
 fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) -> Option<egui::Rect> {
     let screen_rect = ctx.screen_rect();
     let mut ime_cursor_rect = None;
@@ -736,6 +828,7 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) -> Option<egui::Rect> {
                     ui_state.terminal_init_error.as_deref(),
                 );
             });
+        show_close_confirm_dialog(ctx, ui_state);
         return None;
     }
 
@@ -892,6 +985,7 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) -> Option<egui::Rect> {
                                 ui,
                                 ui_state.terminal.as_ref(),
                                 &mut ui_state.terminal_selection,
+                                ui_state.close_confirm_open,
                                 scroll_request,
                                 ui_state.terminal_scroll_id,
                             );
@@ -1016,6 +1110,7 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) -> Option<egui::Rect> {
             }
         });
 
+    show_close_confirm_dialog(ctx, ui_state);
     ime_cursor_rect
 }
 
@@ -1099,6 +1194,9 @@ fn main() {
         pty_grid_size: (0, 0),
         loading_started_at: Instant::now(),
         startup_dir,
+        close_confirm_open: false,
+        close_confirmed: false,
+        close_focus_pending: false,
     };
     let mut window_shown = false;
 
@@ -1115,7 +1213,10 @@ fn main() {
                 // Forward keyboard input to terminal BEFORE egui processes it
                 if let WindowEvent::Ime(winit::event::Ime::Commit(text)) = &event {
                     if let Some(ref terminal) = ui_state.terminal {
-                        if !ui_state.terminal_exited && !text.is_empty() {
+                        if !ui_state.close_confirm_open
+                            && !ui_state.terminal_exited
+                            && !text.is_empty()
+                        {
                             ui_state.terminal_scroll_request =
                                 Some(terminal::ScrollRequest::CursorLine);
                             ui_state.terminal_scroll_request_frames_left = 1;
@@ -1126,7 +1227,7 @@ fn main() {
 
                 if let WindowEvent::KeyboardInput { ref event, .. } = event {
                     if let Some(ref terminal) = ui_state.terminal {
-                        if !ui_state.terminal_exited {
+                        if !ui_state.close_confirm_open && !ui_state.terminal_exited {
                         let ctrl = current_modifiers.state().control_key();
                         let mut skip_cursor_follow = false;
                         if ctrl {
@@ -1161,7 +1262,7 @@ fn main() {
                         && *button == winit::event::MouseButton::Right
                     {
                         if let Some(ref terminal) = ui_state.terminal {
-                            if !ui_state.terminal_exited {
+                            if !ui_state.close_confirm_open && !ui_state.terminal_exited {
                                 if let Ok(mut cb) = arboard::Clipboard::new() {
                                     if ui_state.terminal_selection.has_selection() {
                                         if let Some(text) = terminal::selected_text_for_copy(
@@ -1194,7 +1295,10 @@ fn main() {
 
                 if let WindowEvent::Focused(focused) = &event {
                     if let Some(ref terminal) = ui_state.terminal {
-                        if !ui_state.terminal_exited && terminal.is_focus_in_out_enabled() {
+                        if !ui_state.close_confirm_open
+                            && !ui_state.terminal_exited
+                            && terminal.is_focus_in_out_enabled()
+                        {
                             let seq: &[u8] = if *focused { b"\x1b[I" } else { b"\x1b[O" };
                             terminal.write_to_pty(seq);
                         }
@@ -1204,7 +1308,11 @@ fn main() {
                 let response = egui_state.on_window_event(window.as_ref(), &event);
                 let _ = response;
                 match event {
-                    WindowEvent::CloseRequested => elwt.exit(),
+                    WindowEvent::CloseRequested => {
+                        ui_state.close_confirm_open = true;
+                        ui_state.close_focus_pending = true;
+                        state.window().request_redraw();
+                    }
                     WindowEvent::Resized(size) => state.resize(size),
                     WindowEvent::RedrawRequested => {
                         let loading_elapsed = ui_state.loading_started_at.elapsed().as_secs_f32();
@@ -1277,6 +1385,12 @@ fn main() {
                         let full_output = egui_ctx.run(raw_input, |ctx| {
                             ime_cursor_rect = build_ui(ctx, &mut ui_state);
                         });
+
+                        if ui_state.close_confirmed {
+                            elwt.exit();
+                            return;
+                        }
+
                         egui_state
                             .handle_platform_output(window.as_ref(), full_output.platform_output);
                         if let Some(rect) = ime_cursor_rect {
