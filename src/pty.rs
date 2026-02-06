@@ -40,9 +40,16 @@ mod platform {
     }
 
     pub fn spawn(size: super::PtySize) -> io::Result<(PtyReader, PtyWriter)> {
+        let mut shell = std::process::Command::new("powershell.exe");
+        shell
+            .arg("-NoLogo")
+            .arg("-NoExit")
+            .arg("-Command")
+            .arg("function global:prompt { $p=(Get-Location).Path; $esc=[char]27; $bel=[char]7; Write-Host -NoNewline ($esc + ']633;CWD=' + $p + $bel); '> ' }");
+
         let mut process = conpty::ProcessOptions::default()
             .set_console_size(Some((size.cols as i16, size.rows as i16)))
-            .spawn(std::process::Command::new("powershell.exe"))
+            .spawn(shell)
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
         let reader = process
@@ -89,5 +96,5 @@ mod platform {
     }
 }
 
-pub use platform::{PtyReader, PtyWriter};
 pub use platform::spawn as spawn_pty;
+pub use platform::{PtyReader, PtyWriter};

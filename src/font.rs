@@ -11,12 +11,14 @@ impl FontRasterizer {
         let mut last_err = None;
         for path in candidates {
             match fs::read(&path) {
-                Ok(bytes) => match fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
-                    Ok(font) => return Self { font },
-                    Err(err) => {
-                        last_err = Some(format!("Font parse failed for {}: {}", path, err));
+                Ok(bytes) => {
+                    match fontdue::Font::from_bytes(bytes, fontdue::FontSettings::default()) {
+                        Ok(font) => return Self { font },
+                        Err(err) => {
+                            last_err = Some(format!("Font parse failed for {}: {}", path, err));
+                        }
                     }
-                },
+                }
                 Err(err) => {
                     last_err = Some(format!("Font read failed for {}: {}", path, err));
                 }

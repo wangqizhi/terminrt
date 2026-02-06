@@ -17,6 +17,9 @@ use crate::pty::{self, PtySize, PtyWriter};
 
 pub const TERM_FONT_SIZE: f32 = 14.0;
 const VT_LOG_MAX_LINES: usize = 2000;
+const CWD_OSC_PREFIX: &[u8] = b"\x1b]633;CWD=";
+const OSC_BEL: u8 = 0x07;
+const OSC_ST: &[u8] = b"\x1b\\";
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ScrollRequest {
@@ -24,6 +27,8 @@ pub enum ScrollRequest {
     ScreenTop,
     /// Scroll so the current cursor line is aligned to the top.
     CursorTop,
+    /// Scroll so the current cursor line is visible while typing.
+    CursorLine,
 }
 
 #[derive(Copy, Clone)]
@@ -51,6 +56,8 @@ pub struct TerminalInstance {
     pty_writer: Arc<Mutex<PtyWriter>>,
     vt_lines: VecDeque<String>,
     vt_pending: String,
+    osc_tracking_buffer: Vec<u8>,
+    current_dir: String,
     _reader_thread: thread::JoinHandle<()>,
 }
 
@@ -93,16 +100,24 @@ impl TerminalInstance {
             pty_writer,
             vt_lines: VecDeque::new(),
             vt_pending: String::new(),
+            osc_tracking_buffer: Vec::new(),
+            current_dir: std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| ".".to_string()),
             _reader_thread: reader_thread,
         })
     }
 
     /// Process pending PTY output, feeding bytes into the terminal emulator.
-    pub fn process_input(&mut self) {
+    pub fn process_input(&mut self) -> bool {
+        let mut had_input = false;
         while let Ok(data) = self.rx.try_recv() {
+            had_input = true;
+            self.update_current_dir_from_osc(&data);
             self.append_vt_log(&data);
             self.processor.advance(&mut self.term, &data);
         }
+        had_input
     }
 
     /// Write user input to the PTY.
@@ -135,6 +150,10 @@ impl TerminalInstance {
 
     pub fn cols(&self) -> usize {
         self.term.columns()
+    }
+
+    pub fn current_dir(&self) -> &str {
+        &self.current_dir
     }
 
     pub fn vt_log_lines_len(&self) -> usize {
@@ -201,6 +220,65 @@ impl TerminalInstance {
             self.vt_lines.pop_front();
         }
     }
+
+    fn update_current_dir_from_osc(&mut self, data: &[u8]) {
+        self.osc_tracking_buffer.extend_from_slice(data);
+        let mut cursor = 0usize;
+
+        loop {
+            let slice = &self.osc_tracking_buffer[cursor..];
+            let Some(rel_start) = find_subslice(slice, CWD_OSC_PREFIX) else {
+                let remaining = &self.osc_tracking_buffer[cursor..];
+                let keep = trailing_partial_marker_len(remaining, CWD_OSC_PREFIX);
+                self.osc_tracking_buffer =
+                    remaining[remaining.len().saturating_sub(keep)..].to_vec();
+                return;
+            };
+
+            let start_idx = cursor + rel_start;
+            let content_start = start_idx + CWD_OSC_PREFIX.len();
+            let after_start = &self.osc_tracking_buffer[content_start..];
+
+            let (end_idx, terminator_len) =
+                if let Some(rel_bel) = after_start.iter().position(|&b| b == OSC_BEL) {
+                    (content_start + rel_bel, 1)
+                } else if let Some(rel_st) = find_subslice(after_start, OSC_ST) {
+                    (content_start + rel_st, OSC_ST.len())
+                } else {
+                    self.osc_tracking_buffer = self.osc_tracking_buffer[start_idx..].to_vec();
+                    return;
+                };
+
+            let cwd_bytes = &self.osc_tracking_buffer[content_start..end_idx];
+            if !cwd_bytes.is_empty() {
+                self.current_dir = String::from_utf8_lossy(cwd_bytes).to_string();
+            }
+
+            cursor = end_idx + terminator_len;
+        }
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn trailing_partial_marker_len(data: &[u8], marker: &[u8]) -> usize {
+    if data.is_empty() || marker.is_empty() {
+        return 0;
+    }
+    let max = data.len().min(marker.len().saturating_sub(1));
+    for len in (1..=max).rev() {
+        if data[data.len() - len..] == marker[..len] {
+            return len;
+        }
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -251,10 +329,22 @@ fn named_color_to_egui(named: &NamedColor, is_fg: bool) -> egui::Color32 {
 fn indexed_color_to_egui(idx: u8, _is_fg: bool) -> egui::Color32 {
     // Standard 16 colors
     static ANSI_COLORS: [[u8; 3]; 16] = [
-        [0, 0, 0],       [204, 0, 0],     [78, 154, 6],   [196, 160, 0],
-        [52, 101, 164],   [117, 80, 123],  [6, 152, 154],  [211, 215, 207],
-        [85, 87, 83],     [239, 41, 41],   [138, 226, 52], [252, 233, 79],
-        [114, 159, 207],  [173, 127, 168], [52, 226, 226], [238, 238, 236],
+        [0, 0, 0],
+        [204, 0, 0],
+        [78, 154, 6],
+        [196, 160, 0],
+        [52, 101, 164],
+        [117, 80, 123],
+        [6, 152, 154],
+        [211, 215, 207],
+        [85, 87, 83],
+        [239, 41, 41],
+        [138, 226, 52],
+        [252, 233, 79],
+        [114, 159, 207],
+        [173, 127, 168],
+        [52, 226, 226],
+        [238, 238, 236],
     ];
     if (idx as usize) < 16 {
         let c = ANSI_COLORS[idx as usize];
@@ -294,11 +384,7 @@ pub(crate) fn aligned_row_height(ui: &egui::Ui, font_id: &egui::FontId) -> f32 {
     aligned.max(1.0)
 }
 
-pub(crate) fn aligned_glyph_width(
-    ui: &egui::Ui,
-    font_id: &egui::FontId,
-    ch: char,
-) -> f32 {
+pub(crate) fn aligned_glyph_width(ui: &egui::Ui, font_id: &egui::FontId, ch: char) -> f32 {
     let raw = ui.fonts(|f| f.glyph_width(font_id, ch));
     if raw <= 0.0 {
         return 0.0;
@@ -338,6 +424,12 @@ pub fn render_terminal(
     // so the scroll calculations use the same spacing as the actual layout.
     ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
     let row_height = aligned_row_height(ui, &font_id);
+    let row_height_with_spacing = row_height + ui.spacing().item_spacing.y;
+    let cursor_row_idx = if total_lines == 0 {
+        0
+    } else {
+        (cursor.point.line.0 - top_line).clamp(0, total_lines.saturating_sub(1) as i32) as usize
+    };
 
     // Cursor blink: 500ms on / 500ms off
     let cursor_visible = {
@@ -352,38 +444,52 @@ pub fn render_terminal(
     let mut scroll = egui::ScrollArea::vertical()
         .id_source(("terminal_scroll", scroll_id))
         .auto_shrink([false, false])
-        .animated(false);
+        .animated(true);
 
     if let Some(req) = scroll_request {
         let offset = match req {
             // Show the terminal "screen" (last `screen_lines` rows), not the absolute end of the
             // scrollback buffer (which can be blank below the cursor and confusing on startup).
-            ScrollRequest::ScreenTop => row_height * history_lines as f32,
+            ScrollRequest::ScreenTop => Some(row_height * history_lines as f32),
             // Scroll to absolute top (offset 0) - used for a clean slate
-            ScrollRequest::CursorTop => 0.0,
+            ScrollRequest::CursorTop => Some(0.0),
+            // Cursor follow is handled with viewport-aware logic below.
+            ScrollRequest::CursorLine => None,
         };
-        let offset = align_to_pixels_ceil(offset, pixels_per_point).max(0.0);
-        scroll = scroll.vertical_scroll_offset(offset);
+        if let Some(offset) = offset {
+            let offset = align_to_pixels_ceil(offset, pixels_per_point).max(0.0);
+            scroll = scroll.vertical_scroll_offset(offset);
+        }
     }
-
-    let row_height_with_spacing = row_height + ui.spacing().item_spacing.y;
 
     scroll.show_viewport(ui, |ui, viewport| {
         // Compute content_height with viewport known so that scrolling to
         // ScreenTop (history_lines * row_height) fully hides scrollback.
         // Without this, the remainder (viewport_h - screen_lines * row_height)
         // causes a partial scrollback row to "leak" at the top after Ctrl+L.
-        let natural = (row_height_with_spacing * total_lines as f32
-            - ui.spacing().item_spacing.y)
-            .max(0.0);
-        let content_height =
-            natural.max(row_height * history_lines as f32 + viewport.height());
+        let natural =
+            (row_height_with_spacing * total_lines as f32 - ui.spacing().item_spacing.y).max(0.0);
+        let content_height = natural.max(row_height * history_lines as f32 + viewport.height());
         ui.set_height(content_height);
 
-        let mut min_row =
-            (viewport.min.y / row_height_with_spacing).floor().max(0.0) as usize;
-        let mut max_row =
-            (viewport.max.y / row_height_with_spacing).ceil().max(0.0) as usize + 1;
+        if matches!(scroll_request, Some(ScrollRequest::CursorLine)) {
+            let cursor_top = cursor_row_idx as f32 * row_height_with_spacing;
+            let cursor_bottom = cursor_top + row_height;
+            let cursor_above = cursor_top < viewport.min.y;
+            let cursor_below = cursor_bottom > viewport.max.y;
+
+            // Only scroll when the cursor is outside the visible range.
+            if cursor_above || cursor_below {
+                let target_rect = egui::Rect::from_min_size(
+                    egui::pos2(ui.min_rect().left(), ui.min_rect().top() + cursor_top),
+                    egui::vec2(1.0, row_height),
+                );
+                ui.scroll_to_rect(target_rect, Some(egui::Align::BOTTOM));
+            }
+        }
+
+        let mut min_row = (viewport.min.y / row_height_with_spacing).floor().max(0.0) as usize;
+        let mut max_row = (viewport.max.y / row_height_with_spacing).ceil().max(0.0) as usize + 1;
 
         if min_row > total_lines {
             min_row = total_lines;
@@ -395,8 +501,8 @@ pub fn render_terminal(
             min_row = max_row;
         }
 
-        let row_layout = egui::Layout::left_to_right(egui::Align::Min)
-            .with_cross_align(egui::Align::Min);
+        let row_layout =
+            egui::Layout::left_to_right(egui::Align::Min).with_cross_align(egui::Align::Min);
         let row_start = min_row;
 
         let y_min = ui.max_rect().top() + min_row as f32 * row_height_with_spacing;

@@ -1,7 +1,9 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
-use std::sync::Arc;
 use egui_wgpu::ScreenDescriptor;
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::Instant;
 use wgpu::util::DeviceExt;
 use winit::{
     dpi::PhysicalSize,
@@ -12,17 +14,26 @@ use winit::{
 
 mod font;
 mod pty;
+#[path = "startup-page.rs"]
+mod startup_page;
 mod terminal;
 
 const WINDOW_WIDTH: u32 = 1024;
 const WINDOW_HEIGHT: u32 = 768;
 const SQUARE_SIZE: f32 = 200.0;
 const FONT_SIZE: f32 = 120.0;
+const LEFT_PANEL_WIDTH: f32 = 260.0;
 struct UiState {
     terminal: Option<terminal::TerminalInstance>,
+    pending_terminal: Option<terminal::TerminalInstance>,
+    terminal_init_error: Option<String>,
     terminal_scroll_request: Option<terminal::ScrollRequest>,
     terminal_scroll_request_frames_left: u8,
     terminal_scroll_id: u64,
+    terminal_view_size_px: egui::Vec2,
+    pty_render_size_px: egui::Vec2,
+    pty_grid_size: (usize, usize),
+    loading_started_at: Instant,
 }
 
 #[repr(C)]
@@ -182,19 +193,20 @@ impl State {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
 
-        let uniform_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("uniform bind group layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let uniform_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("uniform bind group layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
 
         let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("uniform bind group"),
@@ -205,48 +217,50 @@ impl State {
             }],
         });
 
-        let glyph_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("glyph bind group layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let glyph_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("glyph bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("main shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shader.wgsl").into()),
         });
 
-        let color_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("color pipeline layout"),
-            bind_group_layouts: &[&uniform_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let color_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("color pipeline layout"),
+                bind_group_layouts: &[&uniform_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let color_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("color pipeline"),
@@ -271,11 +285,12 @@ impl State {
             multiview: None,
         });
 
-        let glyph_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("glyph pipeline layout"),
-            bind_group_layouts: &[&glyph_bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let glyph_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("glyph pipeline layout"),
+                bind_group_layouts: &[&glyph_bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
         let glyph_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("glyph pipeline"),
@@ -307,7 +322,10 @@ impl State {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
 
-        let glyph_vertices = [GlyphVertex { position: [0.0, 0.0], uv: [0.0, 0.0] }; 6];
+        let glyph_vertices = [GlyphVertex {
+            position: [0.0, 0.0],
+            uv: [0.0, 0.0],
+        }; 6];
         let glyph_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("glyph vertex buffer"),
             contents: bytemuck::cast_slice(&glyph_vertices),
@@ -370,15 +388,21 @@ impl State {
 
     fn update_square_vertices(&mut self) {
         let vertices = make_square_vertices(self.size);
-        self.queue
-            .write_buffer(&self.square_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+        self.queue.write_buffer(
+            &self.square_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&vertices),
+        );
     }
 
     fn update_glyph_vertices(&mut self) {
         if let Some((w, h)) = self.glyph_dims {
             let vertices = make_glyph_vertices(self.size, w as f32, h as f32);
-            self.queue
-                .write_buffer(&self.glyph_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+            self.queue.write_buffer(
+                &self.glyph_vertex_buffer,
+                0,
+                bytemuck::cast_slice(&vertices),
+            );
             self.glyph_vertex_count = 6;
         } else {
             self.glyph_vertex_count = 0;
@@ -463,12 +487,22 @@ impl State {
         screen_desc: &ScreenDescriptor,
     ) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let mut encoder = self
             .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("render encoder") });
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("render encoder"),
+            });
 
-        egui_renderer.update_buffers(&self.device, &self.queue, &mut encoder, paint_jobs, screen_desc);
+        egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            paint_jobs,
+            screen_desc,
+        );
 
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -516,17 +550,36 @@ fn make_square_vertices(size: PhysicalSize<u32>) -> [ColorVertex; 6] {
     let (x0, y0, x1, y1) = centered_rect(size, SQUARE_SIZE, SQUARE_SIZE);
     let color = [0.0, 0.0, 0.0, 1.0];
     [
-        ColorVertex { position: [x0, y0], color },
-        ColorVertex { position: [x1, y0], color },
-        ColorVertex { position: [x1, y1], color },
-        ColorVertex { position: [x0, y0], color },
-        ColorVertex { position: [x1, y1], color },
-        ColorVertex { position: [x0, y1], color },
+        ColorVertex {
+            position: [x0, y0],
+            color,
+        },
+        ColorVertex {
+            position: [x1, y0],
+            color,
+        },
+        ColorVertex {
+            position: [x1, y1],
+            color,
+        },
+        ColorVertex {
+            position: [x0, y0],
+            color,
+        },
+        ColorVertex {
+            position: [x1, y1],
+            color,
+        },
+        ColorVertex {
+            position: [x0, y1],
+            color,
+        },
     ]
 }
 
 fn make_glyph_vertices(size: PhysicalSize<u32>, glyph_w: f32, glyph_h: f32) -> [GlyphVertex; 6] {
-    let (square_x0, square_y0, square_x1, square_y1) = centered_rect(size, SQUARE_SIZE, SQUARE_SIZE);
+    let (square_x0, square_y0, square_x1, square_y1) =
+        centered_rect(size, SQUARE_SIZE, SQUARE_SIZE);
     let square_cx = (square_x0 + square_x1) * 0.5;
     let square_cy = (square_y0 + square_y1) * 0.5;
 
@@ -536,12 +589,30 @@ fn make_glyph_vertices(size: PhysicalSize<u32>, glyph_w: f32, glyph_h: f32) -> [
     let y1 = square_cy + glyph_h * 0.5;
 
     [
-        GlyphVertex { position: [x0, y0], uv: [0.0, 0.0] },
-        GlyphVertex { position: [x1, y0], uv: [1.0, 0.0] },
-        GlyphVertex { position: [x1, y1], uv: [1.0, 1.0] },
-        GlyphVertex { position: [x0, y0], uv: [0.0, 0.0] },
-        GlyphVertex { position: [x1, y1], uv: [1.0, 1.0] },
-        GlyphVertex { position: [x0, y1], uv: [0.0, 1.0] },
+        GlyphVertex {
+            position: [x0, y0],
+            uv: [0.0, 0.0],
+        },
+        GlyphVertex {
+            position: [x1, y0],
+            uv: [1.0, 0.0],
+        },
+        GlyphVertex {
+            position: [x1, y1],
+            uv: [1.0, 1.0],
+        },
+        GlyphVertex {
+            position: [x0, y0],
+            uv: [0.0, 0.0],
+        },
+        GlyphVertex {
+            position: [x1, y1],
+            uv: [1.0, 1.0],
+        },
+        GlyphVertex {
+            position: [x0, y1],
+            uv: [0.0, 1.0],
+        },
     ]
 }
 
@@ -632,8 +703,25 @@ fn create_glyph_bind_group(
 
 fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
     let screen_rect = ctx.screen_rect();
+
+    if ui_state.terminal.is_none() {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(14, 14, 14)))
+            .show(ctx, |ui| {
+                ui_state.terminal_view_size_px = ui.available_size();
+                ui_state.pty_render_size_px = egui::Vec2::ZERO;
+                ui_state.pty_grid_size = (0, 0);
+                startup_page::render(
+                    ui,
+                    ui_state.loading_started_at,
+                    ui_state.terminal_init_error.as_deref(),
+                );
+            });
+        return;
+    }
+
     let total_w = screen_rect.width().max(1.0);
-    let side_w = total_w * 0.25;
+    let right_w = total_w * 0.25;
 
     let panel_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(70));
     let side_fill = egui::Color32::from_gray(18);
@@ -641,13 +729,13 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
 
     egui::SidePanel::left("left_panel")
         .resizable(false)
-        .exact_width(side_w)
+        .exact_width(LEFT_PANEL_WIDTH)
         .frame(egui::Frame::none().fill(side_fill).stroke(panel_stroke))
         .show(ctx, |_ui| {});
 
     egui::SidePanel::right("right_panel")
         .resizable(false)
-        .exact_width(side_w)
+        .exact_width(right_w)
         .frame(egui::Frame::none().fill(side_fill).stroke(panel_stroke))
         .show(ctx, |ui| {
             ui.add_space(6.0);
@@ -666,22 +754,49 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
         .show(ctx, |ui| {
             let origin = ui.min_rect().min;
             let available = ui.available_size();
+            let prompt_h = 30.0; // Top prompt bar
             let bottom_h = 28.0; // Fixed height: just enough for status text
-            let top_h = (available.y - bottom_h).max(0.0);
+            let terminal_h = (available.y - prompt_h - bottom_h).max(0.0);
 
-            let top_rect = egui::Rect::from_min_size(origin, egui::vec2(available.x, top_h));
+            let prompt_rect = egui::Rect::from_min_size(origin, egui::vec2(available.x, prompt_h));
+            let terminal_rect = egui::Rect::from_min_size(
+                egui::pos2(origin.x, origin.y + prompt_h),
+                egui::vec2(available.x, terminal_h),
+            );
             let bottom_rect = egui::Rect::from_min_size(
-                egui::pos2(origin.x, origin.y + top_h),
+                egui::pos2(origin.x, origin.y + prompt_h + terminal_h),
                 egui::vec2(available.x, bottom_h),
             );
 
-            // Top area: terminal display
-            ui.allocate_ui_at_rect(top_rect, |ui| {
+            // Top area: command prompt
+            ui.allocate_ui_at_rect(prompt_rect, |ui| {
+                let prompt_label = if let Some(term) = ui_state.terminal.as_ref() {
+                    format!("PS {}", term.current_dir())
+                } else {
+                    "PS .".to_string()
+                };
+                egui::Frame::none()
+                    .fill(egui::Color32::from_gray(22))
+                    .inner_margin(egui::Margin::symmetric(8.0, 6.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(prompt_label)
+                                .color(egui::Color32::from_gray(210))
+                                .monospace()
+                                .size(14.0),
+                        );
+                    });
+            });
+
+            // Middle area: terminal display
+            ui.allocate_ui_at_rect(terminal_rect, |ui| {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(18, 18, 18))
                     .show(ui, |ui| {
+                        let available = ui.available_size();
+                        ui_state.terminal_view_size_px = available;
+
                         if let Some(term) = ui_state.terminal.as_mut() {
-                            let available = ui.available_size();
                             let font_id = egui::FontId::monospace(terminal::TERM_FONT_SIZE);
                             let row_height = terminal::aligned_row_height(ui, &font_id);
                             let char_width = terminal::aligned_glyph_width(ui, &font_id, 'M');
@@ -701,26 +816,50 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
                                         ui_state.terminal_scroll_id.wrapping_add(1);
                                 }
                             }
+
+                            let pty_cols = term.cols();
+                            let pty_rows = term.rows();
+                            ui_state.pty_grid_size = (pty_cols, pty_rows);
+                            ui_state.pty_render_size_px = if row_height > 0.0 && char_width > 0.0 {
+                                egui::vec2(
+                                    char_width * pty_cols as f32,
+                                    row_height * pty_rows as f32,
+                                )
+                            } else {
+                                egui::Vec2::ZERO
+                            };
+                        } else {
+                            ui_state.pty_grid_size = (0, 0);
+                            ui_state.pty_render_size_px = egui::Vec2::ZERO;
                         }
 
-                        let scroll_request = if ui_state.terminal_scroll_request_frames_left > 0 {
-                            ui_state.terminal_scroll_request
-                        } else {
-                            None
-                        };
+                        if ui_state.terminal.is_some() {
+                            let scroll_request = if ui_state.terminal_scroll_request_frames_left > 0
+                            {
+                                ui_state.terminal_scroll_request
+                            } else {
+                                None
+                            };
 
-                        terminal::render_terminal(
-                            ui,
-                            ui_state.terminal.as_ref(),
-                            scroll_request,
-                            ui_state.terminal_scroll_id,
-                        );
+                            terminal::render_terminal(
+                                ui,
+                                ui_state.terminal.as_ref(),
+                                scroll_request,
+                                ui_state.terminal_scroll_id,
+                            );
 
-                        if ui_state.terminal_scroll_request_frames_left > 0 {
-                            ui_state.terminal_scroll_request_frames_left -= 1;
-                            if ui_state.terminal_scroll_request_frames_left == 0 {
-                                ui_state.terminal_scroll_request = None;
+                            if ui_state.terminal_scroll_request_frames_left > 0 {
+                                ui_state.terminal_scroll_request_frames_left -= 1;
+                                if ui_state.terminal_scroll_request_frames_left == 0 {
+                                    ui_state.terminal_scroll_request = None;
+                                }
                             }
+                        } else {
+                            startup_page::render(
+                                ui,
+                                ui_state.loading_started_at,
+                                ui_state.terminal_init_error.as_deref(),
+                            );
                         }
                     });
             });
@@ -736,11 +875,23 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
                         bottom: 8.0,
                     })
                     .show(ui, |ui| {
-                        let status = if ui_state.terminal.is_some() {
-                            "Terminal: connected"
+                        let connect_status = if ui_state.terminal.is_some() {
+                            "connected"
+                        } else if ui_state.terminal_init_error.is_some() {
+                            "failed"
                         } else {
-                            "Terminal: not connected"
+                            "starting"
                         };
+                        let status = format!(
+                            "Terminal: {} | View: {:.0}x{:.0}px | PTY: {:.0}x{:.0}px ({}x{} cells)",
+                            connect_status,
+                            ui_state.terminal_view_size_px.x,
+                            ui_state.terminal_view_size_px.y,
+                            ui_state.pty_render_size_px.x,
+                            ui_state.pty_render_size_px.y,
+                            ui_state.pty_grid_size.0,
+                            ui_state.pty_grid_size.1,
+                        );
                         ui.label(
                             egui::RichText::new(status)
                                 .color(egui::Color32::from_gray(120))
@@ -777,6 +928,7 @@ fn main() {
         WindowBuilder::new()
             .with_title("terminrt")
             .with_inner_size(PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
+            .with_visible(false)
             .build(&event_loop)
             .expect("create window"),
     );
@@ -785,7 +937,9 @@ fn main() {
     let egui_ctx = egui::Context::default();
     if let Some(font_data) = load_system_chinese_font() {
         let mut fonts = egui::FontDefinitions::default();
-        fonts.font_data.insert("zh".to_string(), egui::FontData::from_owned(font_data));
+        fonts
+            .font_data
+            .insert("zh".to_string(), egui::FontData::from_owned(font_data));
         fonts
             .families
             .get_mut(&egui::FontFamily::Proportional)
@@ -807,23 +961,27 @@ fn main() {
     );
     let mut egui_renderer = egui_wgpu::Renderer::new(&state.device, state.config.format, None, 1);
 
-    // Initialize the terminal with default size (will be resized later)
-    let terminal_instance = match terminal::TerminalInstance::new(24, 80) {
-        Ok(t) => {
-            eprintln!("Terminal started successfully");
-            Some(t)
-        }
-        Err(e) => {
-            eprintln!("Failed to start terminal: {}", e);
-            None
-        }
-    };
+    let (terminal_init_tx, terminal_init_rx) =
+        mpsc::channel::<std::io::Result<terminal::TerminalInstance>>();
+    thread::spawn(move || {
+        let result = terminal::TerminalInstance::new(24, 80);
+        let _ = terminal_init_tx.send(result);
+    });
+
     let mut ui_state = UiState {
-        terminal: terminal_instance,
-        terminal_scroll_request: Some(terminal::ScrollRequest::ScreenTop),
-        terminal_scroll_request_frames_left: 30,
+        terminal: None,
+        pending_terminal: None,
+        terminal_init_error: None,
+        terminal_scroll_request: None,
+        terminal_scroll_request_frames_left: 0,
         terminal_scroll_id: 0,
+        terminal_view_size_px: egui::Vec2::ZERO,
+        pty_render_size_px: egui::Vec2::ZERO,
+        pty_grid_size: (0, 0),
+        loading_started_at: Instant::now(),
     };
+    let mut terminal_init_rx = Some(terminal_init_rx);
+    let mut window_shown = false;
 
     let mut current_modifiers = winit::event::Modifiers::default();
 
@@ -839,13 +997,16 @@ fn main() {
                 if let WindowEvent::KeyboardInput { ref event, .. } = event {
                     if let Some(ref terminal) = ui_state.terminal {
                         let ctrl = current_modifiers.state().control_key();
+                        let mut skip_cursor_follow = false;
                         if ctrl {
                             if let winit::keyboard::Key::Character(text) = &event.logical_key {
                                 if text.eq_ignore_ascii_case("l") {
                                     ui_state.terminal_scroll_request =
                                         Some(terminal::ScrollRequest::ScreenTop);
                                     ui_state.terminal_scroll_request_frames_left = 60;
-                                    ui_state.terminal_scroll_id = ui_state.terminal_scroll_id.wrapping_add(1);
+                                    ui_state.terminal_scroll_id =
+                                        ui_state.terminal_scroll_id.wrapping_add(1);
+                                    skip_cursor_follow = true;
                                 }
                             }
                         }
@@ -853,6 +1014,11 @@ fn main() {
                         if let Some(input_bytes) =
                             terminal::key_to_terminal_input(event, &current_modifiers)
                         {
+                            if !skip_cursor_follow {
+                                ui_state.terminal_scroll_request =
+                                    Some(terminal::ScrollRequest::CursorLine);
+                                ui_state.terminal_scroll_request_frames_left = 1;
+                            }
                             terminal.write_to_pty(&input_bytes);
                         }
                     }
@@ -864,9 +1030,49 @@ fn main() {
                     WindowEvent::CloseRequested => elwt.exit(),
                     WindowEvent::Resized(size) => state.resize(size),
                     WindowEvent::RedrawRequested => {
+                        let loading_elapsed = ui_state.loading_started_at.elapsed().as_secs_f32();
+
+                        if ui_state.terminal.is_none() {
+                            if let Some(rx) = terminal_init_rx.as_ref() {
+                                match rx.try_recv() {
+                                    Ok(Ok(term)) => {
+                                        eprintln!("Terminal started successfully");
+                                        ui_state.pending_terminal = Some(term);
+                                        terminal_init_rx = None;
+                                    }
+                                    Ok(Err(e)) => {
+                                        eprintln!("Failed to start terminal: {}", e);
+                                        ui_state.terminal_init_error = Some(e.to_string());
+                                        terminal_init_rx = None;
+                                    }
+                                    Err(mpsc::TryRecvError::Empty) => {}
+                                    Err(mpsc::TryRecvError::Disconnected) => {
+                                        ui_state.terminal_init_error =
+                                            Some("terminal init channel disconnected".to_string());
+                                        terminal_init_rx = None;
+                                    }
+                                }
+                            }
+
+                            if startup_page::is_animation_done(loading_elapsed) {
+                                if let Some(term) = ui_state.pending_terminal.take() {
+                                    ui_state.terminal = Some(term);
+                                    ui_state.terminal_scroll_request =
+                                        Some(terminal::ScrollRequest::ScreenTop);
+                                    ui_state.terminal_scroll_request_frames_left = 30;
+                                    ui_state.terminal_scroll_id =
+                                        ui_state.terminal_scroll_id.wrapping_add(1);
+                                }
+                            }
+                        }
+
                         // Process PTY output before rendering
                         if let Some(ref mut terminal) = ui_state.terminal {
-                            terminal.process_input();
+                            if terminal.process_input() {
+                                ui_state.terminal_scroll_request =
+                                    Some(terminal::ScrollRequest::CursorLine);
+                                ui_state.terminal_scroll_request_frames_left = 1;
+                            }
                         }
 
                         let raw_input = egui_state.take_egui_input(window.as_ref());
@@ -892,7 +1098,8 @@ fn main() {
                             );
                         }
 
-                        match state.render_with_egui(&mut egui_renderer, &paint_jobs, &screen_desc) {
+                        match state.render_with_egui(&mut egui_renderer, &paint_jobs, &screen_desc)
+                        {
                             Ok(()) => {}
                             Err(wgpu::SurfaceError::Lost) => state.resize(state.size),
                             Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
@@ -907,6 +1114,12 @@ fn main() {
                 }
             }
             Event::AboutToWait => {
+                // If the hidden window never gets a redraw while invisible on some platforms,
+                // force-show it here so rendering can proceed.
+                if !window_shown {
+                    state.window().set_visible(true);
+                    window_shown = true;
+                }
                 state.window().request_redraw();
             }
             _ => {}
