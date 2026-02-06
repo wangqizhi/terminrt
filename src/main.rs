@@ -43,6 +43,7 @@ struct UiState {
     close_confirm_open: bool,
     close_confirmed: bool,
     close_focus_pending: bool,
+    devtools_open: bool,
 }
 
 #[repr(C)]
@@ -833,7 +834,7 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) -> Option<egui::Rect> {
     }
 
     let total_w = screen_rect.width().max(1.0);
-    let right_w = total_w * 0.25;
+    let right_w = if ui_state.devtools_open { total_w * 0.25 } else { 0.0 };
 
     let panel_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(70));
     let side_fill = egui::Color32::from_gray(18);
@@ -843,23 +844,42 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) -> Option<egui::Rect> {
         .resizable(false)
         .exact_width(LEFT_PANEL_WIDTH)
         .frame(egui::Frame::none().fill(side_fill).stroke(panel_stroke))
-        .show(ctx, |_ui| {});
-
-    egui::SidePanel::right("right_panel")
-        .resizable(false)
-        .exact_width(right_w)
-        .frame(egui::Frame::none().fill(side_fill).stroke(panel_stroke))
         .show(ctx, |ui| {
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("VT Stream")
-                    .color(egui::Color32::from_gray(180))
-                    .monospace()
-                    .size(12.0),
-            );
-            ui.add_space(6.0);
-            terminal::render_vt_log(ui, ui_state.terminal.as_ref());
+            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
+                ui.add_space(6.0);
+                let label = if ui_state.devtools_open { "DevTools ▶" } else { "DevTools ◀" };
+                let btn = ui.add(
+                    egui::Button::new(
+                        egui::RichText::new(label)
+                            .monospace()
+                            .size(11.0)
+                            .color(egui::Color32::from_gray(160)),
+                    )
+                    .frame(false),
+                );
+                if btn.clicked() {
+                    ui_state.devtools_open = !ui_state.devtools_open;
+                }
+            });
         });
+
+    if ui_state.devtools_open {
+        egui::SidePanel::right("right_panel")
+            .resizable(false)
+            .exact_width(right_w)
+            .frame(egui::Frame::none().fill(side_fill).stroke(panel_stroke))
+            .show(ctx, |ui| {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new("VT Stream")
+                        .color(egui::Color32::from_gray(180))
+                        .monospace()
+                        .size(12.0),
+                );
+                ui.add_space(6.0);
+                terminal::render_vt_log(ui, ui_state.terminal.as_ref());
+            });
+    }
 
     egui::CentralPanel::default()
         .frame(egui::Frame::none().fill(center_fill).stroke(panel_stroke))
@@ -1197,6 +1217,7 @@ fn main() {
         close_confirm_open: false,
         close_confirmed: false,
         close_focus_pending: false,
+        devtools_open: false,
     };
     let mut window_shown = false;
 
