@@ -9,7 +9,7 @@ use alacritty_terminal::event::VoidListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::Flags as CellFlags;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{self, Color as TermColor, NamedColor};
 
 use winit::keyboard::{Key, NamedKey};
@@ -225,6 +225,14 @@ impl TerminalInstance {
 
     pub fn current_dir(&self) -> &str {
         &self.current_dir
+    }
+
+    pub fn is_bracketed_paste_enabled(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    pub fn is_focus_in_out_enabled(&self) -> bool {
+        self.term.mode().contains(TermMode::FOCUS_IN_OUT)
     }
 
     pub fn vt_log_lines_len(&self) -> usize {
@@ -469,7 +477,7 @@ pub fn render_terminal(
     selection_state: &mut TerminalSelectionState,
     scroll_request: Option<ScrollRequest>,
     scroll_id: u64,
-) {
+) -> Option<egui::Rect> {
     let terminal = match terminal {
         Some(t) => t,
         None => {
@@ -478,7 +486,7 @@ pub fn render_terminal(
                     .color(egui::Color32::from_gray(120))
                     .monospace(),
             );
-            return;
+            return None;
         }
     };
 
@@ -503,7 +511,13 @@ pub fn render_terminal(
     } else {
         (cursor.point.line.0 - top_line).clamp(0, total_lines.saturating_sub(1) as i32) as usize
     };
+    let cursor_col_idx = if num_cols == 0 {
+        0
+    } else {
+        cursor.point.column.0.min(num_cols.saturating_sub(1))
+    };
     let selection_range = selection_state.normalized();
+    let mut ime_cursor_rect = None;
 
     // Cursor blink: 500ms on / 500ms off
     let cursor_visible = {
@@ -511,7 +525,7 @@ pub fn render_terminal(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        (ms / 500) % 2 == 0
+        cursor.shape != ansi::CursorShape::Hidden && (ms / 500) % 2 == 0
     };
 
     // Use scroll_id in the ScrollArea ID so Ctrl+L resets the scroll state
@@ -579,6 +593,14 @@ pub fn render_terminal(
             egui::pos2(ui.max_rect().left(), ui.max_rect().top() + viewport.min.y),
             egui::pos2(ui.max_rect().right(), ui.max_rect().top() + viewport.max.y),
         );
+        if total_lines > 0 && num_cols > 0 && char_width > 0.0 && row_height > 0.0 {
+            let cursor_x = viewport_rect.left() + cursor_col_idx as f32 * char_width;
+            let cursor_y = ui.max_rect().top() + cursor_row_idx as f32 * row_height_with_spacing;
+            ime_cursor_rect = Some(egui::Rect::from_min_size(
+                egui::pos2(cursor_x, cursor_y),
+                egui::vec2(char_width.max(1.0), row_height.max(1.0)),
+            ));
+        }
         let to_cell = |pos: egui::Pos2| -> Option<(usize, usize)> {
             if total_lines == 0 || num_cols == 0 || char_width <= 0.0 {
                 return None;
@@ -659,26 +681,38 @@ pub fn render_terminal(
                     let is_selected = selection_range_contains(selection_range, row_idx, col_idx);
 
                     let is_ghost = cell.flags.intersects(CellFlags::DIM | CellFlags::ITALIC);
+                    let is_inverse = cell.flags.contains(CellFlags::INVERSE);
+
+                    // Base colors (before selection/cursor override)
+                    let (mut base_fg, mut base_bg) = if is_ghost {
+                        (egui::Color32::from_gray(140), egui::Color32::TRANSPARENT)
+                    } else {
+                        let f = term_color_to_egui(&cell.fg, true);
+                        let b = term_color_to_egui(&cell.bg, false);
+                        (f, b)
+                    };
+
+                    // Handle SGR 7 (reverse video): swap fg and bg
+                    if is_inverse {
+                        if base_bg == egui::Color32::TRANSPARENT {
+                            base_bg = egui::Color32::from_rgb(18, 18, 18);
+                        }
+                        std::mem::swap(&mut base_fg, &mut base_bg);
+                    }
+
                     let fg = if show_cursor {
                         egui::Color32::from_rgb(18, 18, 18)
                     } else if is_selected {
                         egui::Color32::from_rgb(18, 18, 18)
-                    } else if is_ghost {
-                        egui::Color32::from_gray(140)
                     } else {
-                        term_color_to_egui(&cell.fg, true)
+                        base_fg
                     };
                     let bg = if is_selected {
                         egui::Color32::from_rgb(180, 180, 180)
                     } else if show_cursor {
                         egui::Color32::from_rgb(204, 204, 204)
                     } else {
-                        let bg_color = term_color_to_egui(&cell.bg, false);
-                        if bg_color == egui::Color32::TRANSPARENT {
-                            egui::Color32::TRANSPARENT
-                        } else {
-                            bg_color
-                        }
+                        base_bg
                     };
 
                     let text_format = egui::TextFormat {
@@ -705,6 +739,8 @@ pub fn render_terminal(
             }
         });
     });
+
+    ime_cursor_rect
 }
 
 pub fn selected_text_for_copy(

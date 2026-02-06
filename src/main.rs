@@ -719,8 +719,9 @@ fn spawn_terminal_async(
     terminal_init_rx
 }
 
-fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
+fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) -> Option<egui::Rect> {
     let screen_rect = ctx.screen_rect();
+    let mut ime_cursor_rect = None;
 
     if ui_state.terminal.is_none() {
         egui::CentralPanel::default()
@@ -735,7 +736,7 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
                     ui_state.terminal_init_error.as_deref(),
                 );
             });
-        return;
+        return None;
     }
 
     let total_w = screen_rect.width().max(1.0);
@@ -887,7 +888,7 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
                                 None
                             };
 
-                            terminal::render_terminal(
+                            ime_cursor_rect = terminal::render_terminal(
                                 ui,
                                 ui_state.terminal.as_ref(),
                                 &mut ui_state.terminal_selection,
@@ -1014,6 +1015,8 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
                 text_painter.galley(text_pos, galley, egui::Color32::from_gray(120));
             }
         });
+
+    ime_cursor_rect
 }
 
 fn load_system_chinese_font() -> Option<Vec<u8>> {
@@ -1047,6 +1050,8 @@ fn main() {
             .build(&event_loop)
             .expect("create window"),
     );
+    window.set_ime_allowed(true);
+    window.set_ime_purpose(winit::window::ImePurpose::Terminal);
 
     let mut state = pollster::block_on(State::new(window.clone()));
     let egui_ctx = egui::Context::default();
@@ -1108,6 +1113,17 @@ fn main() {
                 }
 
                 // Forward keyboard input to terminal BEFORE egui processes it
+                if let WindowEvent::Ime(winit::event::Ime::Commit(text)) = &event {
+                    if let Some(ref terminal) = ui_state.terminal {
+                        if !ui_state.terminal_exited && !text.is_empty() {
+                            ui_state.terminal_scroll_request =
+                                Some(terminal::ScrollRequest::CursorLine);
+                            ui_state.terminal_scroll_request_frames_left = 1;
+                            terminal.write_to_pty(text.as_bytes());
+                        }
+                    }
+                }
+
                 if let WindowEvent::KeyboardInput { ref event, .. } = event {
                     if let Some(ref terminal) = ui_state.terminal {
                         if !ui_state.terminal_exited {
@@ -1159,11 +1175,28 @@ fn main() {
                                         ui_state.terminal_selection.clear();
                                     } else if let Ok(text) = cb.get_text() {
                                         if !text.is_empty() {
-                                            terminal.write_to_pty(text.as_bytes());
+                                            if terminal.is_bracketed_paste_enabled() {
+                                                let mut bytes = Vec::with_capacity(text.len() + 12);
+                                                bytes.extend_from_slice(b"\x1b[200~");
+                                                bytes.extend_from_slice(text.as_bytes());
+                                                bytes.extend_from_slice(b"\x1b[201~");
+                                                terminal.write_to_pty(&bytes);
+                                            } else {
+                                                terminal.write_to_pty(text.as_bytes());
+                                            }
                                         }
                                     }
                                 }
                             }
+                        }
+                    }
+                }
+
+                if let WindowEvent::Focused(focused) = &event {
+                    if let Some(ref terminal) = ui_state.terminal {
+                        if !ui_state.terminal_exited && terminal.is_focus_in_out_enabled() {
+                            let seq: &[u8] = if *focused { b"\x1b[I" } else { b"\x1b[O" };
+                            terminal.write_to_pty(seq);
                         }
                     }
                 }
@@ -1240,11 +1273,22 @@ fn main() {
                         }
 
                         let raw_input = egui_state.take_egui_input(window.as_ref());
+                        let mut ime_cursor_rect = None;
                         let full_output = egui_ctx.run(raw_input, |ctx| {
-                            build_ui(ctx, &mut ui_state);
+                            ime_cursor_rect = build_ui(ctx, &mut ui_state);
                         });
                         egui_state
                             .handle_platform_output(window.as_ref(), full_output.platform_output);
+                        if let Some(rect) = ime_cursor_rect {
+                            let ppp = full_output.pixels_per_point;
+                            window.set_ime_cursor_area(
+                                winit::dpi::PhysicalPosition::new(rect.min.x * ppp, rect.min.y * ppp),
+                                winit::dpi::PhysicalSize::new(
+                                    (rect.width() * ppp).max(1.0),
+                                    (rect.height() * ppp).max(1.0),
+                                ),
+                            );
+                        }
 
                         let paint_jobs =
                             egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
