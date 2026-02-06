@@ -18,9 +18,55 @@ use crate::pty::{self, PtySize, PtyWriter};
 
 pub const TERM_FONT_SIZE: f32 = 14.0;
 const VT_LOG_MAX_LINES: usize = 2000;
+const MAX_SELECTION_COPY_BYTES: usize = 2 * 1024 * 1024;
 const CWD_OSC_PREFIX: &[u8] = b"\x1b]633;CWD=";
 const OSC_BEL: u8 = 0x07;
 const OSC_ST: &[u8] = b"\x1b\\";
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TerminalSelectionState {
+    anchor: Option<(usize, usize)>,
+    focus: Option<(usize, usize)>,
+    dragging: bool,
+}
+
+impl TerminalSelectionState {
+    pub fn clear(&mut self) {
+        self.anchor = None;
+        self.focus = None;
+        self.dragging = false;
+    }
+
+    fn start(&mut self, row: usize, col: usize) {
+        self.anchor = Some((row, col));
+        self.focus = Some((row, col));
+        self.dragging = true;
+    }
+
+    fn update(&mut self, row: usize, col: usize) {
+        if self.anchor.is_some() {
+            self.focus = Some((row, col));
+        }
+    }
+
+    fn stop_dragging(&mut self) {
+        self.dragging = false;
+    }
+
+    fn normalized(&self) -> Option<((usize, usize), (usize, usize))> {
+        let mut start = self.anchor?;
+        let mut end = self.focus?;
+        if start > end {
+            std::mem::swap(&mut start, &mut end);
+        }
+        Some((start, end))
+    }
+
+    pub fn has_selection(&self) -> bool {
+        matches!(self.normalized(), Some((start, end)) if start != end)
+    }
+
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ScrollRequest {
@@ -60,6 +106,11 @@ pub struct TerminalInstance {
     osc_tracking_buffer: Vec<u8>,
     current_dir: String,
     _reader_thread: thread::JoinHandle<()>,
+}
+
+pub struct ProcessInputResult {
+    pub had_input: bool,
+    pub pty_closed: bool,
 }
 
 impl TerminalInstance {
@@ -108,15 +159,28 @@ impl TerminalInstance {
     }
 
     /// Process pending PTY output, feeding bytes into the terminal emulator.
-    pub fn process_input(&mut self) -> bool {
+    pub fn process_input(&mut self) -> ProcessInputResult {
         let mut had_input = false;
-        while let Ok(data) = self.rx.try_recv() {
-            had_input = true;
-            self.update_current_dir_from_osc(&data);
-            self.append_vt_log(&data);
-            self.processor.advance(&mut self.term, &data);
+        let mut pty_closed = false;
+        loop {
+            match self.rx.try_recv() {
+                Ok(data) => {
+                    had_input = true;
+                    self.update_current_dir_from_osc(&data);
+                    self.append_vt_log(&data);
+                    self.processor.advance(&mut self.term, &data);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    pty_closed = true;
+                    break;
+                }
+            }
         }
-        had_input
+        ProcessInputResult {
+            had_input,
+            pty_closed,
+        }
     }
 
     /// Write user input to the PTY.
@@ -135,6 +199,14 @@ impl TerminalInstance {
         self.term.resize(dims);
         if let Ok(mut writer) = self.pty_writer.lock() {
             let _ = writer.resize(PtySize { rows, cols });
+        }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        if let Ok(writer) = self.pty_writer.lock() {
+            writer.is_alive()
+        } else {
+            false
         }
     }
 
@@ -394,6 +466,7 @@ pub(crate) fn aligned_glyph_width(ui: &egui::Ui, font_id: &egui::FontId, ch: cha
 pub fn render_terminal(
     ui: &mut egui::Ui,
     terminal: Option<&TerminalInstance>,
+    selection_state: &mut TerminalSelectionState,
     scroll_request: Option<ScrollRequest>,
     scroll_id: u64,
 ) {
@@ -419,6 +492,7 @@ pub fn render_terminal(
     let top_line = -(history_lines as i32);
     let font_id = egui::FontId::monospace(TERM_FONT_SIZE);
     let pixels_per_point = ui.ctx().pixels_per_point();
+    let char_width = aligned_glyph_width(ui, &font_id, 'M');
     // Set item_spacing to 0 BEFORE calculating row_height and show_rows,
     // so the scroll calculations use the same spacing as the actual layout.
     ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
@@ -429,6 +503,7 @@ pub fn render_terminal(
     } else {
         (cursor.point.line.0 - top_line).clamp(0, total_lines.saturating_sub(1) as i32) as usize
     };
+    let selection_range = selection_state.normalized();
 
     // Cursor blink: 500ms on / 500ms off
     let cursor_visible = {
@@ -500,6 +575,59 @@ pub fn render_terminal(
             min_row = max_row;
         }
 
+        let viewport_rect = egui::Rect::from_min_max(
+            egui::pos2(ui.max_rect().left(), ui.max_rect().top() + viewport.min.y),
+            egui::pos2(ui.max_rect().right(), ui.max_rect().top() + viewport.max.y),
+        );
+        let to_cell = |pos: egui::Pos2| -> Option<(usize, usize)> {
+            if total_lines == 0 || num_cols == 0 || char_width <= 0.0 {
+                return None;
+            }
+            if !viewport_rect.contains(pos) {
+                return None;
+            }
+
+            let y = (pos.y - ui.max_rect().top()).max(0.0);
+            let mut row = (y / row_height_with_spacing).floor() as usize;
+            if row >= total_lines {
+                row = total_lines - 1;
+            }
+
+            let x = (pos.x - viewport_rect.left()).max(0.0);
+            let mut col = (x / char_width).floor() as usize;
+            if col >= num_cols {
+                col = num_cols - 1;
+            }
+
+            Some((row, col))
+        };
+
+        ui.input(|i| {
+            let pointer = &i.pointer;
+
+            if pointer.button_pressed(egui::PointerButton::Primary) {
+                if let Some((row, col)) = pointer.interact_pos().and_then(to_cell) {
+                    selection_state.start(row, col);
+                }
+            }
+
+            if selection_state.dragging && pointer.button_down(egui::PointerButton::Primary) {
+                if let Some((row, col)) = pointer.interact_pos().and_then(to_cell) {
+                    selection_state.update(row, col);
+                }
+            }
+
+            if pointer.button_released(egui::PointerButton::Primary) && selection_state.dragging {
+                if let Some((row, col)) = pointer.interact_pos().and_then(to_cell) {
+                    selection_state.update(row, col);
+                }
+                if !selection_state.has_selection() {
+                    selection_state.clear();
+                }
+                selection_state.stop_dragging();
+            }
+        });
+
         let row_layout =
             egui::Layout::left_to_right(egui::Align::Min).with_cross_align(egui::Align::Min);
         let row_start = min_row;
@@ -528,16 +656,21 @@ pub fn render_terminal(
                     if is_wide_continuation {
                         continue;
                     }
+                    let is_selected = selection_range_contains(selection_range, row_idx, col_idx);
 
                     let is_ghost = cell.flags.intersects(CellFlags::DIM | CellFlags::ITALIC);
                     let fg = if show_cursor {
+                        egui::Color32::from_rgb(18, 18, 18)
+                    } else if is_selected {
                         egui::Color32::from_rgb(18, 18, 18)
                     } else if is_ghost {
                         egui::Color32::from_gray(140)
                     } else {
                         term_color_to_egui(&cell.fg, true)
                     };
-                    let bg = if show_cursor {
+                    let bg = if is_selected {
+                        egui::Color32::from_rgb(180, 180, 180)
+                    } else if show_cursor {
                         egui::Color32::from_rgb(204, 204, 204)
                     } else {
                         let bg_color = term_color_to_egui(&cell.bg, false);
@@ -572,6 +705,113 @@ pub fn render_terminal(
             }
         });
     });
+}
+
+pub fn selected_text_for_copy(
+    terminal: &TerminalInstance,
+    selection_state: &TerminalSelectionState,
+) -> Option<String> {
+    if !selection_state.has_selection() {
+        return None;
+    }
+    selected_text(terminal.term(), selection_state)
+}
+
+fn selection_range_contains(
+    range: Option<((usize, usize), (usize, usize))>,
+    row: usize,
+    col: usize,
+) -> bool {
+    let Some(((start_row, start_col), (end_row, end_col))) = range else {
+        return false;
+    };
+
+    if row < start_row || row > end_row {
+        return false;
+    }
+    if start_row == end_row {
+        return row == start_row && col >= start_col && col <= end_col;
+    }
+    if row == start_row {
+        return col >= start_col;
+    }
+    if row == end_row {
+        return col <= end_col;
+    }
+    true
+}
+
+fn selected_text(term: &Term<VoidListener>, selection_state: &TerminalSelectionState) -> Option<String> {
+    let ((start_row, start_col), (end_row, end_col)) = selection_state.normalized()?;
+    if start_row == end_row && start_col == end_col {
+        return None;
+    }
+
+    let grid = term.grid();
+    let total_lines = grid.total_lines();
+    let num_cols = term.columns();
+    if total_lines == 0 || num_cols == 0 || start_row >= total_lines {
+        return None;
+    }
+
+    let history_lines = grid.history_size();
+    let top_line = -(history_lines as i32);
+    let last_row = end_row.min(total_lines - 1);
+    let selected_rows = last_row.saturating_sub(start_row) + 1;
+    let estimated = selected_rows.saturating_mul(num_cols.saturating_add(1));
+    let reserve = estimated.min(MAX_SELECTION_COPY_BYTES);
+    let mut out = String::with_capacity(reserve);
+
+    'rows: for row_idx in start_row..=last_row {
+        if out.len() >= MAX_SELECTION_COPY_BYTES {
+            break;
+        }
+        let line = Line(top_line + row_idx as i32);
+        let row = &grid[line];
+        let line_start = if row_idx == start_row { start_col } else { 0 };
+        let line_end = if row_idx == last_row {
+            end_col.min(num_cols - 1)
+        } else {
+            num_cols - 1
+        };
+
+        if line_start > line_end {
+            continue;
+        }
+
+        let row_start_len = out.len();
+        let mut row_non_space_len = 0usize;
+        for col_idx in line_start..=line_end {
+            let cell = &row[Column(col_idx)];
+            if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            let ch_len = ch.len_utf8();
+            if out.len().saturating_add(ch_len) > MAX_SELECTION_COPY_BYTES {
+                out.truncate(row_start_len + row_non_space_len);
+                break 'rows;
+            }
+            out.push(ch);
+            if ch != ' ' {
+                row_non_space_len = out.len() - row_start_len;
+            }
+        }
+        out.truncate(row_start_len + row_non_space_len);
+
+        if row_idx != last_row {
+            if out.len().saturating_add(1) > MAX_SELECTION_COPY_BYTES {
+                break;
+            }
+            out.push('\n');
+        }
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 pub fn render_vt_log(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {

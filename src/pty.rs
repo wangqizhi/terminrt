@@ -33,6 +33,10 @@ mod platform {
             self.writer.write_all(data)
         }
 
+        pub fn is_alive(&self) -> bool {
+            self.process.is_alive()
+        }
+
         pub fn resize(&mut self, size: super::PtySize) -> io::Result<()> {
             self.process
                 .resize(size.cols as i16, size.rows as i16)
@@ -42,11 +46,12 @@ mod platform {
 
     pub fn spawn(size: super::PtySize, startup_dir: &Path) -> io::Result<(PtyReader, PtyWriter)> {
         let mut shell = std::process::Command::new("powershell.exe");
+
         shell
             .arg("-NoLogo")
             .arg("-NoExit")
             .arg("-Command")
-            .arg("function global:prompt { $p=(Get-Location).Path; $esc=[char]27; $bel=[char]7; Write-Host -NoNewline ($esc + ']633;CWD=' + $p + $bel); '> ' }")
+            .arg("function global:prompt { $p=(Get-Location).Path; $esc=[char]27; $bel=[char]7; Write-Host -NoNewline ($esc + ']633;CWD=' + $p + $bel); 'PS ' + $p + '> ' }")
             .current_dir(startup_dir);
 
         let mut process = conpty::ProcessOptions::default()
@@ -82,6 +87,10 @@ mod platform {
 
     impl PtyWriter {
         pub fn write_all(&mut self, _data: &[u8]) -> io::Result<()> {
+            unimplemented!("PTY not yet implemented for this platform")
+        }
+
+        pub fn is_alive(&self) -> bool {
             unimplemented!("PTY not yet implemented for this platform")
         }
 

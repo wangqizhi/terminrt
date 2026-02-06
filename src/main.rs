@@ -26,8 +26,12 @@ const FONT_SIZE: f32 = 120.0;
 const LEFT_PANEL_WIDTH: f32 = 260.0;
 struct UiState {
     terminal: Option<terminal::TerminalInstance>,
+    terminal_selection: terminal::TerminalSelectionState,
     pending_terminal: Option<terminal::TerminalInstance>,
     terminal_init_error: Option<String>,
+    terminal_exited: bool,
+    terminal_connecting: bool,
+    reconnect_requested: bool,
     terminal_scroll_request: Option<terminal::ScrollRequest>,
     terminal_scroll_request_frames_left: u8,
     terminal_scroll_id: u64,
@@ -35,6 +39,7 @@ struct UiState {
     pty_render_size_px: egui::Vec2,
     pty_grid_size: (usize, usize),
     loading_started_at: Instant,
+    startup_dir: PathBuf,
 }
 
 #[repr(C)]
@@ -702,6 +707,18 @@ fn create_glyph_bind_group(
     })
 }
 
+fn spawn_terminal_async(
+    startup_dir: PathBuf,
+) -> mpsc::Receiver<std::io::Result<terminal::TerminalInstance>> {
+    let (terminal_init_tx, terminal_init_rx) =
+        mpsc::channel::<std::io::Result<terminal::TerminalInstance>>();
+    thread::spawn(move || {
+        let result = terminal::TerminalInstance::new(24, 80, startup_dir);
+        let _ = terminal_init_tx.send(result);
+    });
+    terminal_init_rx
+}
+
 fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
     let screen_rect = ctx.screen_rect();
 
@@ -779,8 +796,43 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
                 egui::vec2(available.x, bottom_h),
             );
 
-            // Top area: reserve space (text painted later on top layer)
-            ui.allocate_ui_at_rect(prompt_rect, |_ui| {});
+            // Top area: reconnect controls when shell exited.
+            ui.allocate_ui_at_rect(prompt_rect, |ui| {
+                if ui_state.terminal_exited {
+                    ui.with_layout(
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("PowerShell exited")
+                                    .monospace()
+                                    .color(egui::Color32::from_gray(190))
+                                    .size(12.0),
+                            );
+                            ui.add_space(8.0);
+                            let reconnect = ui.add_enabled(
+                                !ui_state.terminal_connecting,
+                                egui::Button::new(
+                                    egui::RichText::new("Reconnect").monospace().size(12.0),
+                                )
+                                .min_size(egui::vec2(92.0, 18.0)),
+                            );
+                            if reconnect.clicked() {
+                                ui_state.reconnect_requested = true;
+                            }
+                            if ui_state.terminal_connecting {
+                                ui.add_space(8.0);
+                                ui.label(
+                                    egui::RichText::new("Reconnecting...")
+                                        .monospace()
+                                        .color(egui::Color32::from_gray(150))
+                                        .size(12.0),
+                                );
+                            }
+                        },
+                    );
+                }
+            });
 
             // Middle area: terminal display
             ui.allocate_ui_at_rect(terminal_rect, |ui| {
@@ -838,6 +890,7 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
                             terminal::render_terminal(
                                 ui,
                                 ui_state.terminal.as_ref(),
+                                &mut ui_state.terminal_selection,
                                 scroll_request,
                                 ui_state.terminal_scroll_id,
                             );
@@ -875,21 +928,29 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
             let bar_color = egui::Color32::from_gray(bar_gray);
             let bar_transparent = egui::Color32::from_rgba_unmultiplied(bar_gray, bar_gray, bar_gray, 0);
 
-            // Top prompt bar solid background
-            fg_painter.rect_filled(prompt_fill, 0.0, bar_color);
+            if !ui_state.terminal_exited {
+                // Top prompt bar solid background
+                fg_painter.rect_filled(prompt_fill, 0.0, bar_color);
 
-            // Top gradient: solid → transparent (downward)
-            {
-                let grad_top = prompt_rect.bottom();
-                let grad_bottom = grad_top + bar_fade;
-                let mut mesh = egui::Mesh::default();
-                mesh.colored_vertex(egui::pos2(prompt_fill.left(), grad_top), bar_color);
-                mesh.colored_vertex(egui::pos2(prompt_fill.right(), grad_top), bar_color);
-                mesh.colored_vertex(egui::pos2(prompt_fill.right(), grad_bottom), bar_transparent);
-                mesh.colored_vertex(egui::pos2(prompt_fill.left(), grad_bottom), bar_transparent);
-                mesh.add_triangle(0, 1, 2);
-                mesh.add_triangle(0, 2, 3);
-                fg_painter.add(egui::Shape::mesh(mesh));
+                // Top gradient: solid → transparent (downward)
+                {
+                    let grad_top = prompt_rect.bottom();
+                    let grad_bottom = grad_top + bar_fade;
+                    let mut mesh = egui::Mesh::default();
+                    mesh.colored_vertex(egui::pos2(prompt_fill.left(), grad_top), bar_color);
+                    mesh.colored_vertex(egui::pos2(prompt_fill.right(), grad_top), bar_color);
+                    mesh.colored_vertex(
+                        egui::pos2(prompt_fill.right(), grad_bottom),
+                        bar_transparent,
+                    );
+                    mesh.colored_vertex(
+                        egui::pos2(prompt_fill.left(), grad_bottom),
+                        bar_transparent,
+                    );
+                    mesh.add_triangle(0, 1, 2);
+                    mesh.add_triangle(0, 2, 3);
+                    fg_painter.add(egui::Shape::mesh(mesh));
+                }
             }
 
             // Bottom status bar solid background
@@ -916,27 +977,18 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) {
             );
             let text_painter = ui.ctx().layer_painter(text_layer);
 
-            // Top prompt text
-            {
-                let prompt_label = if let Some(term) = ui_state.terminal.as_ref() {
-                    format!("PS {}", term.current_dir())
-                } else {
-                    "PS .".to_string()
-                };
-                let font_id = egui::FontId::monospace(14.0);
-                let galley = text_painter.layout_no_wrap(
-                    prompt_label,
-                    font_id,
-                    egui::Color32::from_gray(210),
-                );
-                let text_pos = egui::pos2(prompt_rect.left() + 8.0, prompt_rect.top() + 4.0);
-                text_painter.galley(text_pos, galley, egui::Color32::from_gray(210));
-            }
+            // Top prompt bar: reserved for future use
 
             // Bottom status text
             {
                 let connect_status = if ui_state.terminal.is_some() {
-                    "connected"
+                    if ui_state.terminal_exited {
+                        "exited"
+                    } else if ui_state.terminal_connecting {
+                        "reconnecting"
+                    } else {
+                        "connected"
+                    }
                 } else if ui_state.terminal_init_error.is_some() {
                     "failed"
                 } else {
@@ -1024,17 +1076,16 @@ fn main() {
     );
     let mut egui_renderer = egui_wgpu::Renderer::new(&state.device, state.config.format, None, 1);
 
-    let (terminal_init_tx, terminal_init_rx) =
-        mpsc::channel::<std::io::Result<terminal::TerminalInstance>>();
-    thread::spawn(move || {
-        let result = terminal::TerminalInstance::new(24, 80, startup_dir);
-        let _ = terminal_init_tx.send(result);
-    });
+    let mut terminal_init_rx = Some(spawn_terminal_async(startup_dir.clone()));
 
     let mut ui_state = UiState {
         terminal: None,
+        terminal_selection: terminal::TerminalSelectionState::default(),
         pending_terminal: None,
         terminal_init_error: None,
+        terminal_exited: false,
+        terminal_connecting: true,
+        reconnect_requested: false,
         terminal_scroll_request: None,
         terminal_scroll_request_frames_left: 0,
         terminal_scroll_id: 0,
@@ -1042,8 +1093,8 @@ fn main() {
         pty_render_size_px: egui::Vec2::ZERO,
         pty_grid_size: (0, 0),
         loading_started_at: Instant::now(),
+        startup_dir,
     };
-    let mut terminal_init_rx = Some(terminal_init_rx);
     let mut window_shown = false;
 
     let mut current_modifiers = winit::event::Modifiers::default();
@@ -1059,6 +1110,7 @@ fn main() {
                 // Forward keyboard input to terminal BEFORE egui processes it
                 if let WindowEvent::KeyboardInput { ref event, .. } = event {
                     if let Some(ref terminal) = ui_state.terminal {
+                        if !ui_state.terminal_exited {
                         let ctrl = current_modifiers.state().control_key();
                         let mut skip_cursor_follow = false;
                         if ctrl {
@@ -1084,6 +1136,35 @@ fn main() {
                             }
                             terminal.write_to_pty(&input_bytes);
                         }
+                        }
+                    }
+                }
+
+                if let WindowEvent::MouseInput { state, button, .. } = &event {
+                    if *state == winit::event::ElementState::Pressed
+                        && *button == winit::event::MouseButton::Right
+                    {
+                        if let Some(ref terminal) = ui_state.terminal {
+                            if !ui_state.terminal_exited {
+                                if let Ok(mut cb) = arboard::Clipboard::new() {
+                                    if ui_state.terminal_selection.has_selection() {
+                                        if let Some(text) = terminal::selected_text_for_copy(
+                                            terminal,
+                                            &ui_state.terminal_selection,
+                                        ) {
+                                            if !text.is_empty() {
+                                                let _ = cb.set_text(text);
+                                            }
+                                        }
+                                        ui_state.terminal_selection.clear();
+                                    } else if let Ok(text) = cb.get_text() {
+                                        if !text.is_empty() {
+                                            terminal.write_to_pty(text.as_bytes());
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1095,46 +1176,66 @@ fn main() {
                     WindowEvent::RedrawRequested => {
                         let loading_elapsed = ui_state.loading_started_at.elapsed().as_secs_f32();
 
-                        if ui_state.terminal.is_none() {
-                            if let Some(rx) = terminal_init_rx.as_ref() {
-                                match rx.try_recv() {
-                                    Ok(Ok(term)) => {
-                                        eprintln!("Terminal started successfully");
-                                        ui_state.pending_terminal = Some(term);
-                                        terminal_init_rx = None;
-                                    }
-                                    Ok(Err(e)) => {
-                                        eprintln!("Failed to start terminal: {}", e);
-                                        ui_state.terminal_init_error = Some(e.to_string());
-                                        terminal_init_rx = None;
-                                    }
-                                    Err(mpsc::TryRecvError::Empty) => {}
-                                    Err(mpsc::TryRecvError::Disconnected) => {
-                                        ui_state.terminal_init_error =
-                                            Some("terminal init channel disconnected".to_string());
-                                        terminal_init_rx = None;
-                                    }
+                        if ui_state.reconnect_requested && terminal_init_rx.is_none() {
+                            terminal_init_rx = Some(spawn_terminal_async(ui_state.startup_dir.clone()));
+                            ui_state.reconnect_requested = false;
+                            ui_state.terminal_connecting = true;
+                            ui_state.terminal_init_error = None;
+                        }
+
+                        if let Some(rx) = terminal_init_rx.as_ref() {
+                            match rx.try_recv() {
+                                Ok(Ok(term)) => {
+                                    eprintln!("Terminal started successfully");
+                                    ui_state.pending_terminal = Some(term);
+                                    ui_state.terminal_init_error = None;
+                                    ui_state.terminal_connecting = false;
+                                    terminal_init_rx = None;
+                                }
+                                Ok(Err(e)) => {
+                                    eprintln!("Failed to start terminal: {}", e);
+                                    ui_state.terminal_init_error = Some(e.to_string());
+                                    ui_state.terminal_connecting = false;
+                                    terminal_init_rx = None;
+                                }
+                                Err(mpsc::TryRecvError::Empty) => {}
+                                Err(mpsc::TryRecvError::Disconnected) => {
+                                    ui_state.terminal_init_error =
+                                        Some("terminal init channel disconnected".to_string());
+                                    ui_state.terminal_connecting = false;
+                                    terminal_init_rx = None;
                                 }
                             }
+                        }
 
-                            if startup_page::is_animation_done(loading_elapsed) {
-                                if let Some(term) = ui_state.pending_terminal.take() {
-                                    ui_state.terminal = Some(term);
-                                    ui_state.terminal_scroll_request =
-                                        Some(terminal::ScrollRequest::ScreenTop);
-                                    ui_state.terminal_scroll_request_frames_left = 30;
-                                    ui_state.terminal_scroll_id =
-                                        ui_state.terminal_scroll_id.wrapping_add(1);
-                                }
+                        if let Some(term) = ui_state.pending_terminal.take() {
+                            if ui_state.terminal.is_none()
+                                && !startup_page::is_animation_done(loading_elapsed)
+                            {
+                                ui_state.pending_terminal = Some(term);
+                            } else {
+                                ui_state.terminal = Some(term);
+                                ui_state.terminal_selection.clear();
+                                ui_state.terminal_exited = false;
+                                ui_state.terminal_scroll_request =
+                                    Some(terminal::ScrollRequest::ScreenTop);
+                                ui_state.terminal_scroll_request_frames_left = 30;
+                                ui_state.terminal_scroll_id =
+                                    ui_state.terminal_scroll_id.wrapping_add(1);
                             }
                         }
 
                         // Process PTY output before rendering
                         if let Some(ref mut terminal) = ui_state.terminal {
-                            if terminal.process_input() {
+                            let process_result = terminal.process_input();
+                            if process_result.had_input {
                                 ui_state.terminal_scroll_request =
                                     Some(terminal::ScrollRequest::CursorLine);
                                 ui_state.terminal_scroll_request_frames_left = 1;
+                            }
+                            if process_result.pty_closed || !terminal.is_alive() {
+                                ui_state.terminal_exited = true;
+                                ui_state.terminal_connecting = false;
                             }
                         }
 
