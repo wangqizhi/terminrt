@@ -14,16 +14,18 @@ use winit::{
 };
 
 mod font;
+mod leftpanel;
 mod pty;
 #[path = "startup-page.rs"]
 mod startup_page;
 mod terminal;
+mod devtools;
+mod topbar;
 
 const WINDOW_WIDTH: u32 = 1638;
 const WINDOW_HEIGHT: u32 = 1024;
 const SQUARE_SIZE: f32 = 200.0;
 const FONT_SIZE: f32 = 120.0;
-const LEFT_PANEL_WIDTH: f32 = 260.0;
 struct UiState {
     terminal: Option<terminal::TerminalInstance>,
     terminal_selection: terminal::TerminalSelectionState,
@@ -44,6 +46,7 @@ struct UiState {
     close_confirmed: bool,
     close_focus_pending: bool,
     devtools_open: bool,
+    devtools_state: devtools::DevToolsState,
 }
 
 #[repr(C)]
@@ -812,73 +815,33 @@ fn show_close_confirm_dialog(ctx: &egui::Context, ui_state: &mut UiState) {
         });
 }
 
-fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) -> Option<egui::Rect> {
+fn build_ui(
+    ctx: &egui::Context,
+    ui_state: &mut UiState,
+    window: &winit::window::Window,
+) -> Option<egui::Rect> {
     let screen_rect = ctx.screen_rect();
     let mut ime_cursor_rect = None;
-
-    if ui_state.terminal.is_none() {
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(egui::Color32::from_rgb(14, 14, 14)))
-            .show(ctx, |ui| {
-                ui_state.terminal_view_size_px = ui.available_size();
-                ui_state.pty_render_size_px = egui::Vec2::ZERO;
-                ui_state.pty_grid_size = (0, 0);
-                startup_page::render(
-                    ui,
-                    ui_state.loading_started_at,
-                    ui_state.terminal_init_error.as_deref(),
-                );
-            });
-        show_close_confirm_dialog(ctx, ui_state);
-        return None;
-    }
 
     let total_w = screen_rect.width().max(1.0);
     let right_w = if ui_state.devtools_open { total_w * 0.25 } else { 0.0 };
 
     let panel_stroke = egui::Stroke::new(1.0, egui::Color32::from_gray(70));
-    let side_fill = egui::Color32::from_gray(18);
-    let center_fill = egui::Color32::from_gray(20);
+    let center_fill = if ui_state.terminal.is_none() {
+        egui::Color32::from_rgb(14, 14, 14)
+    } else {
+        egui::Color32::from_gray(20)
+    };
 
-    egui::SidePanel::left("left_panel")
-        .resizable(false)
-        .exact_width(LEFT_PANEL_WIDTH)
-        .frame(egui::Frame::none().fill(side_fill).stroke(panel_stroke))
-        .show(ctx, |ui| {
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::Center), |ui| {
-                ui.add_space(6.0);
-                let label = if ui_state.devtools_open { "DevTools ▶" } else { "DevTools ◀" };
-                let btn = ui.add(
-                    egui::Button::new(
-                        egui::RichText::new(label)
-                            .monospace()
-                            .size(11.0)
-                            .color(egui::Color32::from_gray(160)),
-                    )
-                    .frame(false),
-                );
-                if btn.clicked() {
-                    ui_state.devtools_open = !ui_state.devtools_open;
-                }
-            });
-        });
+    leftpanel::render(ctx, &mut ui_state.devtools_open);
 
     if ui_state.devtools_open {
-        egui::SidePanel::right("right_panel")
-            .resizable(false)
-            .exact_width(right_w)
-            .frame(egui::Frame::none().fill(side_fill).stroke(panel_stroke))
-            .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new("VT Stream")
-                        .color(egui::Color32::from_gray(180))
-                        .monospace()
-                        .size(12.0),
-                );
-                ui.add_space(6.0);
-                terminal::render_vt_log(ui, ui_state.terminal.as_ref());
-            });
+        devtools::render_devtools(
+            ctx,
+            &mut ui_state.devtools_state,
+            ui_state.terminal.as_ref(),
+            right_w,
+        );
     }
 
     egui::CentralPanel::default()
@@ -911,41 +874,29 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) -> Option<egui::Rect> {
                 egui::vec2(available.x, bottom_h),
             );
 
-            // Top area: reconnect controls when shell exited.
+            // Top area: custom title bar with reconnect controls + window buttons.
             ui.allocate_ui_at_rect(prompt_rect, |ui| {
-                if ui_state.terminal_exited {
-                    ui.with_layout(
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("PowerShell exited")
-                                    .monospace()
-                                    .color(egui::Color32::from_gray(190))
-                                    .size(12.0),
-                            );
-                            ui.add_space(8.0);
-                            let reconnect = ui.add_enabled(
-                                !ui_state.terminal_connecting,
-                                egui::Button::new(
-                                    egui::RichText::new("Reconnect").monospace().size(12.0),
-                                )
-                                .min_size(egui::vec2(92.0, 18.0)),
-                            );
-                            if reconnect.clicked() {
-                                ui_state.reconnect_requested = true;
-                            }
-                            if ui_state.terminal_connecting {
-                                ui.add_space(8.0);
-                                ui.label(
-                                    egui::RichText::new("Reconnecting...")
-                                        .monospace()
-                                        .color(egui::Color32::from_gray(150))
-                                        .size(12.0),
-                                );
-                            }
-                        },
-                    );
+                let action = topbar::render(
+                    ui,
+                    topbar::TopBarInput {
+                        terminal_exited: ui_state.terminal_exited,
+                        terminal_connecting: ui_state.terminal_connecting,
+                        reconnect_requested: &mut ui_state.reconnect_requested,
+                    },
+                    egui::Color32::from_gray(bar_gray),
+                );
+                if action.request_minimize {
+                    window.set_minimized(true);
+                }
+                if action.request_toggle_maximize {
+                    window.set_maximized(!window.is_maximized());
+                }
+                if action.request_drag_window {
+                    let _ = window.drag_window();
+                }
+                if action.request_close {
+                    ui_state.close_confirm_open = true;
+                    ui_state.close_focus_pending = true;
                 }
             });
 
@@ -1044,29 +995,24 @@ fn build_ui(ctx: &egui::Context, ui_state: &mut UiState) -> Option<egui::Rect> {
             let bar_color = egui::Color32::from_gray(bar_gray);
             let bar_transparent = egui::Color32::from_rgba_unmultiplied(bar_gray, bar_gray, bar_gray, 0);
 
-            if !ui_state.terminal_exited {
-                // Top prompt bar solid background
-                fg_painter.rect_filled(prompt_fill, 0.0, bar_color);
-
-                // Top gradient: solid → transparent (downward)
-                {
-                    let grad_top = prompt_rect.bottom();
-                    let grad_bottom = grad_top + bar_fade;
-                    let mut mesh = egui::Mesh::default();
-                    mesh.colored_vertex(egui::pos2(prompt_fill.left(), grad_top), bar_color);
-                    mesh.colored_vertex(egui::pos2(prompt_fill.right(), grad_top), bar_color);
-                    mesh.colored_vertex(
-                        egui::pos2(prompt_fill.right(), grad_bottom),
-                        bar_transparent,
-                    );
-                    mesh.colored_vertex(
-                        egui::pos2(prompt_fill.left(), grad_bottom),
-                        bar_transparent,
-                    );
-                    mesh.add_triangle(0, 1, 2);
-                    mesh.add_triangle(0, 2, 3);
-                    fg_painter.add(egui::Shape::mesh(mesh));
-                }
+            // Top gradient: solid → transparent (downward)
+            {
+                let grad_top = prompt_rect.bottom();
+                let grad_bottom = grad_top + bar_fade;
+                let mut mesh = egui::Mesh::default();
+                mesh.colored_vertex(egui::pos2(prompt_fill.left(), grad_top), bar_color);
+                mesh.colored_vertex(egui::pos2(prompt_fill.right(), grad_top), bar_color);
+                mesh.colored_vertex(
+                    egui::pos2(prompt_fill.right(), grad_bottom),
+                    bar_transparent,
+                );
+                mesh.colored_vertex(
+                    egui::pos2(prompt_fill.left(), grad_bottom),
+                    bar_transparent,
+                );
+                mesh.add_triangle(0, 1, 2);
+                mesh.add_triangle(0, 2, 3);
+                fg_painter.add(egui::Shape::mesh(mesh));
             }
 
             // Bottom status bar solid background
@@ -1162,6 +1108,7 @@ fn main() {
         WindowBuilder::new()
             .with_title("terminrt")
             .with_inner_size(PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT))
+            .with_decorations(false)
             .with_visible(false)
             .build(&event_loop)
             .expect("create window"),
@@ -1219,6 +1166,7 @@ fn main() {
         close_confirmed: false,
         close_focus_pending: false,
         devtools_open: false,
+        devtools_state: devtools::DevToolsState::default(),
     };
     let mut window_shown = false;
 
@@ -1234,7 +1182,7 @@ fn main() {
 
                 // Forward keyboard input to terminal BEFORE egui processes it
                 if let WindowEvent::Ime(winit::event::Ime::Commit(text)) = &event {
-                    if let Some(ref terminal) = ui_state.terminal {
+                    if let Some(ref mut terminal) = ui_state.terminal {
                         if !ui_state.close_confirm_open
                             && !ui_state.terminal_exited
                             && !text.is_empty()
@@ -1248,7 +1196,7 @@ fn main() {
                 }
 
                 if let WindowEvent::KeyboardInput { ref event, .. } = event {
-                    if let Some(ref terminal) = ui_state.terminal {
+                    if let Some(ref mut terminal) = ui_state.terminal {
                         if !ui_state.close_confirm_open && !ui_state.terminal_exited {
                         let ctrl = current_modifiers.state().control_key();
                         let is_ctrl_l = ctrl
@@ -1282,7 +1230,7 @@ fn main() {
                     if *state == winit::event::ElementState::Pressed
                         && *button == winit::event::MouseButton::Right
                     {
-                        if let Some(ref terminal) = ui_state.terminal {
+                        if let Some(ref mut terminal) = ui_state.terminal {
                             if !ui_state.close_confirm_open && !ui_state.terminal_exited {
                                 if let Ok(mut cb) = arboard::Clipboard::new() {
                                     if ui_state.terminal_selection.has_selection() {
@@ -1315,7 +1263,7 @@ fn main() {
                 }
 
                 if let WindowEvent::Focused(focused) = &event {
-                    if let Some(ref terminal) = ui_state.terminal {
+                    if let Some(ref mut terminal) = ui_state.terminal {
                         if !ui_state.close_confirm_open
                             && !ui_state.terminal_exited
                             && terminal.is_focus_in_out_enabled()
@@ -1413,7 +1361,7 @@ fn main() {
                         let raw_input = egui_state.take_egui_input(window.as_ref());
                         let mut ime_cursor_rect = None;
                         let full_output = egui_ctx.run(raw_input, |ctx| {
-                            ime_cursor_rect = build_ui(ctx, &mut ui_state);
+                            ime_cursor_rect = build_ui(ctx, &mut ui_state, window.as_ref());
                         });
 
                         if ui_state.close_confirmed {

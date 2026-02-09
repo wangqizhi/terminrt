@@ -23,6 +23,12 @@ const CWD_OSC_PREFIX: &[u8] = b"\x1b]633;CWD=";
 const OSC_BEL: u8 = 0x07;
 const OSC_ST: &[u8] = b"\x1b\\";
 
+#[derive(Clone, Debug)]
+pub enum VtLogEntry {
+    Input(String),
+    Output(String),
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TerminalSelectionState {
     anchor: Option<(usize, usize)>,
@@ -101,7 +107,7 @@ pub struct TerminalInstance {
     processor: ansi::Processor,
     rx: mpsc::Receiver<Vec<u8>>,
     pty_writer: Arc<Mutex<PtyWriter>>,
-    vt_lines: VecDeque<String>,
+    vt_lines: VecDeque<VtLogEntry>,
     vt_pending: String,
     osc_tracking_buffer: Vec<u8>,
     current_dir: String,
@@ -184,9 +190,26 @@ impl TerminalInstance {
     }
 
     /// Write user input to the PTY.
-    pub fn write_to_pty(&self, data: &[u8]) {
+    pub fn write_to_pty(&mut self, data: &[u8]) {
         if let Ok(mut writer) = self.pty_writer.lock() {
             let _ = writer.write_all(data);
+        }
+        
+        // Log input
+        let mut log_str = String::new();
+        for &b in data {
+             match b {
+                b'\n' => log_str.push_str("\\n"),
+                b'\r' => log_str.push_str("\\r"),
+                b'\t' => log_str.push_str("\\t"),
+                0x1b => log_str.push_str("\\x1b"),
+                0x20..=0x7e => log_str.push(b as char),
+                _ => log_str.push_str(&format!("\\x{:02X}", b)),
+            }
+        }
+        self.vt_lines.push_back(VtLogEntry::Input(log_str));
+         while self.vt_lines.len() > VT_LOG_MAX_LINES {
+            self.vt_lines.pop_front();
         }
     }
 
@@ -239,12 +262,12 @@ impl TerminalInstance {
         self.vt_lines.len() + if self.vt_pending.is_empty() { 0 } else { 1 }
     }
 
-    pub fn vt_log_line(&self, index: usize) -> Option<&str> {
+    pub fn vt_log_line(&self, index: usize) -> Option<VtLogEntry> {
         if index < self.vt_lines.len() {
-            return self.vt_lines.get(index).map(|line| line.as_str());
+            return self.vt_lines.get(index).cloned();
         }
         if !self.vt_pending.is_empty() && index == self.vt_lines.len() {
-            return Some(self.vt_pending.as_str());
+            return Some(VtLogEntry::Output(self.vt_pending.clone()));
         }
         None
     }
@@ -294,7 +317,7 @@ impl TerminalInstance {
 
     fn push_vt_line(&mut self) {
         let line = std::mem::take(&mut self.vt_pending);
-        self.vt_lines.push_back(line);
+        self.vt_lines.push_back(VtLogEntry::Output(line));
         while self.vt_lines.len() > VT_LOG_MAX_LINES {
             self.vt_lines.pop_front();
         }
@@ -872,24 +895,45 @@ pub fn render_vt_log(ui: &mut egui::Ui, terminal: Option<&TerminalInstance>) {
 
     let total_lines = terminal.vt_log_lines_len();
     let font_id = egui::FontId::monospace(12.0);
-    let row_height = ui.fonts(|f| f.row_height(&font_id)).max(1.0);
+    // Rough estimate of row height
+    let row_height = ui.fonts(|f| f.row_height(&font_id));
 
     egui::ScrollArea::both()
         .auto_shrink([false, false])
         .stick_to_bottom(true)
         .show_rows(ui, row_height, total_lines, |ui, row_range| {
-            ui.style_mut().spacing.item_spacing = egui::vec2(0.0, 0.0);
+            // Use tighter spacing
+            ui.style_mut().spacing.item_spacing = egui::vec2(4.0, 2.0);
             for row_idx in row_range {
-                let Some(line) = terminal.vt_log_line(row_idx) else {
+                let Some(entry) = terminal.vt_log_line(row_idx) else {
                     continue;
                 };
-                let label = egui::Label::new(
-                    egui::RichText::new(line)
-                        .monospace()
-                        .color(egui::Color32::from_gray(170)),
-                )
-                .wrap(false);
-                ui.add(label);
+                
+                let (text, color, icon) = match &entry {
+                    VtLogEntry::Input(s) => (s, egui::Color32::from_rgb(100, 200, 100), "➜"),
+                    VtLogEntry::Output(s) => (s, egui::Color32::from_gray(170), " "),
+                };
+                
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(icon)
+                            .monospace()
+                            .size(12.0)
+                            .color(if matches!(entry, VtLogEntry::Input(_)) {
+                                egui::Color32::from_rgb(100, 200, 100)
+                            } else {
+                                egui::Color32::TRANSPARENT // Output: invisible icon just for spacing? or empty string.
+                            })
+                    );
+                    
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(text)
+                                .monospace()
+                                .color(color)
+                        ).wrap(false)
+                    );
+                });
             }
         });
 }
