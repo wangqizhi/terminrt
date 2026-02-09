@@ -617,6 +617,7 @@ pub fn render_terminal(
             egui::pos2(ui.max_rect().left(), ui.max_rect().top() + viewport.min.y),
             egui::pos2(ui.max_rect().right(), ui.max_rect().top() + viewport.max.y),
         );
+        let text_grid_max_x = viewport_rect.left() + char_width * num_cols as f32;
         if total_lines > 0 && num_cols > 0 && char_width > 0.0 && row_height > 0.0 {
             let cursor_x = viewport_rect.left() + cursor_col_idx as f32 * char_width;
             let cursor_y = ui.max_rect().top() + cursor_row_idx as f32 * row_height_with_spacing;
@@ -630,6 +631,10 @@ pub fn render_terminal(
                 return None;
             }
             if !viewport_rect.contains(pos) {
+                return None;
+            }
+            // Ignore clicks in the right gutter / scrollbar region.
+            if pos.x >= text_grid_max_x {
                 return None;
             }
 
