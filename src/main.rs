@@ -21,6 +21,8 @@ mod startup_page;
 mod terminal;
 mod devtools;
 mod topbar;
+mod quickcmd;
+mod settings;
 
 const WINDOW_WIDTH: u32 = 1638;
 const WINDOW_HEIGHT: u32 = 1024;
@@ -47,6 +49,10 @@ struct UiState {
     close_focus_pending: bool,
     devtools_open: bool,
     devtools_state: devtools::DevToolsState,
+    quickcmd_config: quickcmd::QuickCommandConfig,
+    settings_state: settings::SettingsState,
+    /// Pending quick command to write to PTY (set by UI, consumed by event loop).
+    pending_quick_cmd: Option<(String, bool)>,
 }
 
 #[repr(C)]
@@ -833,15 +839,28 @@ fn build_ui(
         egui::Color32::from_gray(20)
     };
 
-    leftpanel::render(ctx, &mut ui_state.devtools_open);
+    let left_action = leftpanel::render(ctx, &mut ui_state.devtools_open);
+    if left_action.open_settings {
+        ui_state.settings_state.open = true;
+    }
 
     if ui_state.devtools_open {
-        devtools::render_devtools(
+        let qcmd_action = devtools::render_devtools(
             ctx,
             &mut ui_state.devtools_state,
             ui_state.terminal.as_ref(),
+            &ui_state.quickcmd_config,
+            &mut ui_state.settings_state,
             right_w,
         );
+        if let Some(act) = qcmd_action {
+            ui_state.pending_quick_cmd = Some((act.command, act.auto_execute));
+        }
+    }
+
+    // Settings modal (rendered on top)
+    if settings::render_settings(ctx, &mut ui_state.settings_state, &mut ui_state.quickcmd_config) {
+        quickcmd::save_config(&ui_state.quickcmd_config);
     }
 
     egui::CentralPanel::default()
@@ -1167,6 +1186,9 @@ fn main() {
         close_focus_pending: false,
         devtools_open: false,
         devtools_state: devtools::DevToolsState::default(),
+        quickcmd_config: quickcmd::load_config(),
+        settings_state: settings::SettingsState::default(),
+        pending_quick_cmd: None,
     };
     let mut window_shown = false;
 
@@ -1184,6 +1206,7 @@ fn main() {
                 if let WindowEvent::Ime(winit::event::Ime::Commit(text)) = &event {
                     if let Some(ref mut terminal) = ui_state.terminal {
                         if !ui_state.close_confirm_open
+                            && !ui_state.settings_state.open
                             && !ui_state.terminal_exited
                             && !text.is_empty()
                         {
@@ -1196,8 +1219,50 @@ fn main() {
                 }
 
                 if let WindowEvent::KeyboardInput { ref event, .. } = event {
+                    // --- Quick command keybinding matching ---
+                    if event.state.is_pressed()
+                        && !event.repeat
+                        && !ui_state.close_confirm_open
+                        && !ui_state.settings_state.open
+                        && !ui_state.terminal_exited
+                        && ui_state.terminal.is_some()
+                    {
+                        let ctrl = current_modifiers.state().control_key();
+                        let alt = current_modifiers.state().alt_key();
+                        let shift = current_modifiers.state().shift_key();
+                        let key_name = match &event.logical_key {
+                            winit::keyboard::Key::Character(text) => {
+                                Some(format!("{}", text.to_uppercase()))
+                            }
+                            winit::keyboard::Key::Named(named) => {
+                                Some(format!("{:?}", named))
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(kn) = key_name {
+                            // Only match when at least one modifier is held
+                            // (to avoid intercepting normal typing)
+                            if ctrl || alt {
+                                let probe = quickcmd::KeyBinding {
+                                    ctrl,
+                                    alt,
+                                    shift,
+                                    key: kn,
+                                };
+                                if let Some(cmd) = ui_state.quickcmd_config.find_by_keybinding(&probe) {
+                                    ui_state.pending_quick_cmd =
+                                        Some((cmd.command.clone(), cmd.auto_execute));
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(ref mut terminal) = ui_state.terminal {
-                        if !ui_state.close_confirm_open && !ui_state.terminal_exited {
+                        if !ui_state.close_confirm_open
+                            && !ui_state.settings_state.open
+                            && !ui_state.terminal_exited
+                        {
                         let ctrl = current_modifiers.state().control_key();
                         let is_ctrl_l = ctrl
                             && matches!(
@@ -1231,7 +1296,10 @@ fn main() {
                         && *button == winit::event::MouseButton::Right
                     {
                         if let Some(ref mut terminal) = ui_state.terminal {
-                            if !ui_state.close_confirm_open && !ui_state.terminal_exited {
+                            if !ui_state.close_confirm_open
+                                && !ui_state.settings_state.open
+                                && !ui_state.terminal_exited
+                            {
                                 if let Ok(mut cb) = arboard::Clipboard::new() {
                                     if ui_state.terminal_selection.has_selection() {
                                         if let Some(text) = terminal::selected_text_for_copy(
@@ -1265,6 +1333,7 @@ fn main() {
                 if let WindowEvent::Focused(focused) = &event {
                     if let Some(ref mut terminal) = ui_state.terminal {
                         if !ui_state.close_confirm_open
+                            && !ui_state.settings_state.open
                             && !ui_state.terminal_exited
                             && terminal.is_focus_in_out_enabled()
                         {
@@ -1355,6 +1424,21 @@ fn main() {
                             if process_result.pty_closed || !terminal.is_alive() {
                                 ui_state.terminal_exited = true;
                                 ui_state.terminal_connecting = false;
+                            }
+                        }
+
+                        // Execute pending quick command (from UI click or keybinding)
+                        if let Some((cmd_text, auto_exec)) = ui_state.pending_quick_cmd.take() {
+                            if let Some(ref mut terminal) = ui_state.terminal {
+                                if !ui_state.terminal_exited {
+                                    terminal.write_to_pty(cmd_text.as_bytes());
+                                    if auto_exec {
+                                        terminal.write_to_pty(b"\r");
+                                    }
+                                    ui_state.terminal_scroll_request =
+                                        Some(terminal::ScrollRequest::CursorLine);
+                                    ui_state.terminal_scroll_request_frames_left = 1;
+                                }
                             }
                         }
 

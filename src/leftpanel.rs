@@ -2,9 +2,18 @@ use egui::{Align, Color32, Layout, RichText};
 
 const LEFT_PANEL_WIDTH: f32 = 260.0;
 
-pub fn render(ctx: &egui::Context, devtools_open: &mut bool) {
+pub struct LeftPanelAction {
+    pub toggle_devtools: bool,
+    pub open_settings: bool,
+}
+
+pub fn render(ctx: &egui::Context, devtools_open: &mut bool) -> LeftPanelAction {
     let panel_stroke = egui::Stroke::new(1.0, Color32::from_gray(70));
     let side_fill = Color32::from_gray(18);
+    let mut action = LeftPanelAction {
+        toggle_devtools: false,
+        open_settings: false,
+    };
 
     egui::SidePanel::left("left_panel")
         .resizable(false)
@@ -13,7 +22,7 @@ pub fn render(ctx: &egui::Context, devtools_open: &mut bool) {
         .show(ctx, |ui| {
             let panel_rect = ui.max_rect();
             let header_h = 56.0;
-            let footer_h = 40.0;
+            let footer_h = 70.0;
 
             let header_rect = egui::Rect::from_min_size(
                 panel_rect.min,
@@ -39,6 +48,8 @@ pub fn render(ctx: &egui::Context, devtools_open: &mut bool) {
             ui.allocate_ui_at_rect(footer_rect, |ui| {
                 ui.with_layout(Layout::bottom_up(Align::Center), |ui| {
                     ui.add_space(6.0);
+
+                    // DevTools toggle
                     let label = if *devtools_open { "DevTools ▶" } else { "DevTools ◀" };
                     let btn = ui.add(
                         egui::Button::new(
@@ -51,8 +62,25 @@ pub fn render(ctx: &egui::Context, devtools_open: &mut bool) {
                     );
                     if btn.clicked() {
                         *devtools_open = !*devtools_open;
+                        action.toggle_devtools = true;
+                    }
+
+                    // Settings button
+                    let settings_btn = ui.add(
+                        egui::Button::new(
+                            RichText::new("⚙ Settings")
+                                .monospace()
+                                .size(11.0)
+                                .color(Color32::from_gray(160)),
+                        )
+                        .frame(false),
+                    );
+                    if settings_btn.clicked() {
+                        action.open_settings = true;
                     }
                 });
             });
         });
+
+    action
 }
