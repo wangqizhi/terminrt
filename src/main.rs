@@ -28,6 +28,7 @@ const WINDOW_WIDTH: u32 = 1638;
 const WINDOW_HEIGHT: u32 = 1024;
 const SQUARE_SIZE: f32 = 200.0;
 const FONT_SIZE: f32 = 120.0;
+const ENABLE_QUICKCMD_KEYBINDINGS: bool = true;
 struct UiState {
     terminal: Option<terminal::TerminalInstance>,
     terminal_selection: terminal::TerminalSelectionState,
@@ -1197,6 +1198,11 @@ fn main() {
     let _ = event_loop.run(move |event, elwt| {
         match event {
             Event::WindowEvent { event, window_id } if window_id == state.window().id() => {
+                let terminal_input_active = ui_state.terminal.is_some()
+                    && !ui_state.close_confirm_open
+                    && !ui_state.settings_state.open
+                    && !ui_state.terminal_exited;
+
                 // Track modifier state
                 if let WindowEvent::ModifiersChanged(mods) = &event {
                     current_modifiers = mods.clone();
@@ -1204,12 +1210,8 @@ fn main() {
 
                 // Forward keyboard input to terminal BEFORE egui processes it
                 if let WindowEvent::Ime(winit::event::Ime::Commit(text)) = &event {
-                    if let Some(ref mut terminal) = ui_state.terminal {
-                        if !ui_state.close_confirm_open
-                            && !ui_state.settings_state.open
-                            && !ui_state.terminal_exited
-                            && !text.is_empty()
-                        {
+                    if terminal_input_active && !text.is_empty() {
+                        if let Some(ref mut terminal) = ui_state.terminal {
                             ui_state.terminal_scroll_request =
                                 Some(terminal::ScrollRequest::CursorLine);
                             ui_state.terminal_scroll_request_frames_left = 1;
@@ -1220,7 +1222,8 @@ fn main() {
 
                 if let WindowEvent::KeyboardInput { ref event, .. } = event {
                     // --- Quick command keybinding matching ---
-                    if event.state.is_pressed()
+                    if ENABLE_QUICKCMD_KEYBINDINGS
+                        && event.state.is_pressed()
                         && !event.repeat
                         && !ui_state.close_confirm_open
                         && !ui_state.settings_state.open
@@ -1259,34 +1262,31 @@ fn main() {
                     }
 
                     if let Some(ref mut terminal) = ui_state.terminal {
-                        if !ui_state.close_confirm_open
-                            && !ui_state.settings_state.open
-                            && !ui_state.terminal_exited
-                        {
-                        let ctrl = current_modifiers.state().control_key();
-                        let is_ctrl_l = ctrl
-                            && matches!(
-                                &event.logical_key,
-                                winit::keyboard::Key::Character(text) if text.eq_ignore_ascii_case("l")
-                            );
+                        if terminal_input_active {
+                            let ctrl = current_modifiers.state().control_key();
+                            let is_ctrl_l = ctrl
+                                && matches!(
+                                    &event.logical_key,
+                                    winit::keyboard::Key::Character(text) if text.eq_ignore_ascii_case("l")
+                                );
 
-                        if is_ctrl_l {
-                            if event.state.is_pressed() && !event.repeat {
+                            if is_ctrl_l {
+                                if event.state.is_pressed() && !event.repeat {
+                                    ui_state.terminal_scroll_request =
+                                        Some(terminal::ScrollRequest::ScreenTop);
+                                    ui_state.terminal_scroll_request_frames_left = 60;
+                                    ui_state.terminal_scroll_id =
+                                        ui_state.terminal_scroll_id.wrapping_add(1);
+                                    terminal.write_to_pty(&[0x0c]);
+                                }
+                            } else if let Some(input_bytes) =
+                                terminal::key_to_terminal_input(event, &current_modifiers)
+                            {
                                 ui_state.terminal_scroll_request =
-                                    Some(terminal::ScrollRequest::ScreenTop);
-                                ui_state.terminal_scroll_request_frames_left = 60;
-                                ui_state.terminal_scroll_id =
-                                    ui_state.terminal_scroll_id.wrapping_add(1);
-                                terminal.write_to_pty(&[0x0c]);
+                                    Some(terminal::ScrollRequest::CursorLine);
+                                ui_state.terminal_scroll_request_frames_left = 1;
+                                terminal.write_to_pty(&input_bytes);
                             }
-                        } else if let Some(input_bytes) =
-                            terminal::key_to_terminal_input(event, &current_modifiers)
-                        {
-                            ui_state.terminal_scroll_request =
-                                Some(terminal::ScrollRequest::CursorLine);
-                            ui_state.terminal_scroll_request_frames_left = 1;
-                            terminal.write_to_pty(&input_bytes);
-                        }
                         }
                     }
                 }
@@ -1343,8 +1343,18 @@ fn main() {
                     }
                 }
 
-                let response = egui_state.on_window_event(window.as_ref(), &event);
-                let _ = response;
+                // While terminal input is active, keep keyboard/IME from reaching egui
+                // to avoid focus-navigation activating window controls.
+                let forward_to_egui = match &event {
+                    WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_) => {
+                        !terminal_input_active
+                    }
+                    _ => true,
+                };
+                if forward_to_egui {
+                    let response = egui_state.on_window_event(window.as_ref(), &event);
+                    let _ = response;
+                }
                 match event {
                     WindowEvent::CloseRequested => {
                         ui_state.close_confirm_open = true;
