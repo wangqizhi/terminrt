@@ -54,6 +54,10 @@ struct UiState {
     settings_state: settings::SettingsState,
     /// Pending quick command to write to PTY (set by UI, consumed by event loop).
     pending_quick_cmd: Option<(String, bool)>,
+    /// Terminal content area rect (egui points), used for file-drop hit testing.
+    terminal_drop_rect: Option<egui::Rect>,
+    /// Latest cursor position in egui points.
+    last_cursor_pos: Option<egui::Pos2>,
 }
 
 #[repr(C)]
@@ -733,6 +737,17 @@ fn spawn_terminal_async(
     terminal_init_rx
 }
 
+fn format_dropped_path_for_powershell(path: &std::path::Path) -> String {
+    let raw = path.to_string_lossy();
+    if raw.is_empty() {
+        return String::new();
+    }
+
+    // PowerShell single-quoted string escaping: ' -> ''
+    let escaped = raw.replace('\'', "''");
+    format!("'{}' ", escaped)
+}
+
 fn show_close_confirm_dialog(ctx: &egui::Context, ui_state: &mut UiState) {
     if !ui_state.close_confirm_open {
         return;
@@ -829,6 +844,7 @@ fn build_ui(
 ) -> Option<egui::Rect> {
     let screen_rect = ctx.screen_rect();
     let mut ime_cursor_rect = None;
+    ui_state.terminal_drop_rect = None;
 
     let total_w = screen_rect.width().max(1.0);
     let right_w = if ui_state.devtools_open { total_w * 0.25 } else { 0.0 };
@@ -889,6 +905,7 @@ fn build_ui(
                 egui::pos2(origin.x + term_left_pad, origin.y + prompt_h + term_top_pad),
                 egui::vec2((available.x - term_left_pad).max(0.0), terminal_h),
             );
+            ui_state.terminal_drop_rect = Some(terminal_rect);
             let bottom_rect = egui::Rect::from_min_size(
                 egui::pos2(origin.x, origin.y + prompt_h + term_top_pad + terminal_h + term_bot_pad),
                 egui::vec2(available.x, bottom_h),
@@ -1190,6 +1207,8 @@ fn main() {
         quickcmd_config: quickcmd::load_config(),
         settings_state: settings::SettingsState::default(),
         pending_quick_cmd: None,
+        terminal_drop_rect: None,
+        last_cursor_pos: None,
     };
     let mut window_shown = false;
 
@@ -1206,6 +1225,36 @@ fn main() {
                 // Track modifier state
                 if let WindowEvent::ModifiersChanged(mods) = &event {
                     current_modifiers = mods.clone();
+                }
+
+                if let WindowEvent::CursorMoved { position, .. } = &event {
+                    let scale = window.scale_factor() as f32;
+                    if scale > 0.0 {
+                        ui_state.last_cursor_pos = Some(egui::pos2(
+                            position.x as f32 / scale,
+                            position.y as f32 / scale,
+                        ));
+                    }
+                }
+
+                if let WindowEvent::DroppedFile(path) = &event {
+                    let dropped_over_terminal = ui_state
+                        .terminal_drop_rect
+                        .zip(ui_state.last_cursor_pos)
+                        .map(|(rect, pos)| rect.contains(pos))
+                        .unwrap_or(false);
+
+                    if terminal_input_active && dropped_over_terminal {
+                        if let Some(ref mut terminal) = ui_state.terminal {
+                            let dropped_text = format_dropped_path_for_powershell(path);
+                            if !dropped_text.is_empty() {
+                                ui_state.terminal_scroll_request =
+                                    Some(terminal::ScrollRequest::CursorLine);
+                                ui_state.terminal_scroll_request_frames_left = 1;
+                                terminal.write_to_pty(dropped_text.as_bytes());
+                            }
+                        }
+                    }
                 }
 
                 // Forward keyboard input to terminal BEFORE egui processes it
